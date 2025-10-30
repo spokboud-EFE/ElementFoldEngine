@@ -1,0 +1,20 @@
+name: elementfold
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - pip
+  - numpy
+  - scipy
+  - pytorch
+  - torchvision
+  - torchaudio
+  - matplotlib
+  - pandas
+  - numba
+  - sympy
+  - pytest
+  - black
+  - isort
