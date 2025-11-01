@@ -9,13 +9,14 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python
+  - python=3.11
   - pip
   - numpy
   - scipy
   - pytorch
   - torchvision
   - torchaudio
+  - sounddevice
   - matplotlib
   - pandas
   - numba
