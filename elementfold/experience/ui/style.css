@@ -1,0 +1,78 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   ElementFold UI • minimal styles
+   Goals:
+   • spacious layout with readable font sizes,
+   • logical visual grouping,
+   • no dependencies (pure CSS).
+   ────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --bg: #fafafa;
+  --fg: #111;
+  --muted: #666;
+  --accent: #0a7;
+  --border: #ddd;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  line-height: 1.6;
+}
+
+h1 { margin: 0 0 8px; font-size: 22px; }
+h2 { margin: 24px 0 8px; font-size: 18px; }
+hr { border: 0; border-top: 1px solid var(--border); margin: 24px 0; }
+
+header { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+#status { color: var(--muted); }
+
+.row { margin: 12px 0; display: block; }
+.cols { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.col label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+
+textarea {
+  width: 100%;
+  min-height: 72px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  font-family: var(--sans);
+  font-size: 14px;
+}
+
+select, input[type="number"], button {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  font-size: 14px;
+}
+
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+
+pre {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.mono { font-family: var(--mono); }
+
+.hint { color: var(--muted); font-size: 12px; }
+audio { width: 100%; }
