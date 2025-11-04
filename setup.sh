@@ -62,17 +62,6 @@ conda activate elementfold
 #python -V
 #python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"
 python -m elementfold --help
-# 1) Environment check
-#python -m elementfold doctor
-#
-## 2) Train with a config file (TOML) and override a couple params
-#python -m elementfold train --config configs/small.toml --steps 400 --print-every 100 --out runs/small_01
-#
-## 3) Train the steering controller
-#python -m elementfold steering-train --steps 800 --print-every 100 --out runs/steering/ctrl.pt
-#
-## 4) Infer from your run
-#python -m elementfold infer --ckpt runs/test1/checkpoint.pt --prompt "A calm introduction..."
 
 
 #python - <<'PY'
@@ -80,4 +69,17 @@ python -m elementfold --help
 #print("Torch version:", torch.__version__)
 #print("CUDA available?", torch.cuda.is_available())
 #print("MPS (Apple Metal) available?", torch.backends.mps.is_available())
+#PY
+
+
+#python - <<'PY'
+#from elementfold.rung_controller import RungController, RungIntent
+#
+#r = RungController(delta=0.5, intent=RungIntent.SEEK, k_target=3)
+#
+#print("Initial:", r.status())
+#for step in range(12):
+#    tele = {"κ":0.3, "p½":0.45, "x_mean": step*0.25}
+#    ctrl = r.update(tele, {"beta":1.0,"gamma":0.5,"clamp":5.0})
+#    print(f"step {step:02d} | ctrl={ctrl} | state={r.status()['phase']}")
 #PY

@@ -1,76 +1,57 @@
 # elementfold/rung_controller.py
 # ──────────────────────────────────────────────────────────────────────────────
-# RungController — on‑demand click (rung) control for ElementFold
-#     • default: passthrough (does nothing; stable with existing code)
-#     • 'hold'     → keep the system centered on the nearest rung
-#     • 'step_up'  → deliberately reach the mid‑step, cross, and capture the next rung
-#     • 'step_down'→ same but toward the previous rung
+# RungController — coherence‑aware control shim for ElementFold
+#   • Exports RungIntent enum used by train.py loss shaping
+#   • Blends tiny overrides (β, γ, ⛔ clamp) on top of Supervisor output
+#   • Optional SEEK mode toward a target rung k_target using a safe FSM
 #
-# Where it plugs in (one line change in your training loop):
-#     ctrl_sup = sup.update(tele)
-#     ctrl_out = rung.update(tele, ctrl_sup)      # ← add this
-#     model.apply_control(**ctrl_out)
-#
-# Non‑expert picture:
-#   Think of a washboard with bumps every δ⋆ in the hidden log variable X.
-#   The Supervisor keeps the ride smooth; this controller, when told,
-#   gently lowers damping (γ), raises exposure (β), and walks you over the
-#   half‑bump, then restores damping to lock the next groove.
-#
-# Inputs it reads (best effort — all optional, safe fallbacks):
-#   tele["delta"] or tele["δ⋆"] or passed-in delta → the click size
-#   tele["kappa"] or tele["κ"]                   → coherence score
-#   tele["p_half"] or tele["p½"]                 → “how near the half‑step” fraction
-#   tele["x_mean"] (preferred if present)        → average X to compute residuals
-#
-# Outputs it sets:
-#   A tiny override of beta / gamma / clamp (⛔) via {beta:..., gamma:..., clamp:...}
-#
-# Safety rails:
-#   • Hard clamps on β, γ, ⛔ (see _clip()) so you can’t push unstable commands.
-#   • Internal state machine with dwell times; once a click completes, it re‑locks.
+# This file is intentionally lean (no heavy deps; pure stdlib).
+# It replaces older variants that exposed different RungIntent shapes or ctor args.
 #
 # MIT‑style tiny utility; zero dependencies outside standard library.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Literal
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, Dict, Literal, Union
 
-Mode = Literal["off", "passthrough", "hold", "step_up", "step_down"]
+ModePhase = Literal["LOCKED", "MID", "CROSSING", "CAPTURE"]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# User intent (what you want done)
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class RungIntent:
-    """
-    What should the controller try to do?
-
-    mode
-      "off" / "passthrough": do nothing (just return the Supervisor’s control)
-      "hold":                center and keep the nearest rung
-      "step_up":             cross the barrier and capture the next higher rung
-      "step_down":           same toward the next lower rung
-
-    steps
-      How many clicks to execute (for step_*). After each captured rung,
-      the internal counter decreases; reaching 0 returns to "hold".
-    """
-    mode: Mode = "passthrough"
-    steps: int = 0
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Tuning knobs (gentle defaults; all values dimensionless)
+# Public: RungIntent used both by the controller *and* by train.py for loss shaping
+# ──────────────────────────────────────────────────────────────────────────────
+
+class RungIntent(str, Enum):
+    """High‑level policy around rungs used by training and control."""
+    STABILIZE = "stabilize"  # keep within acceptance band; default
+    HOLD      = "hold"       # actively center and damp on the nearest rung
+    SEEK      = "seek"       # walk across barriers toward k_target (if provided)
+
+
+def _as_intent(x: Union[str, "RungIntent", None]) -> RungIntent:
+    if isinstance(x, RungIntent):
+        return x
+    if isinstance(x, str):
+        x = x.lower().strip()
+        for v in RungIntent:
+            if v.value == x:
+                return v
+    return RungIntent.STABILIZE
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tuning
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class RungTuning:
     """
     Gentle defaults that behave well on CPU/GPU smoke tests.
+    All values dimensionless. Clamp (⛔) is a magnitude cap on auxiliary updates.
     """
-    # Acceptance band half‑width; ~= δ⋆/6 by convention
+    # Acceptance band half‑width; default ≈ δ⋆/6
     epsilon_scale: float = 1 / 6
 
     # State machine thresholds (fallbacks if tele['p_half'] unavailable)
@@ -101,18 +82,12 @@ class RungTuning:
     clamp_min: float = 1.0
     clamp_max: float = 12.0
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Internal state (simple finite‑state machine)
-# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class _RungState:
-    phase: Literal["IDLE", "LOCKED", "MID", "CROSSING", "CAPTURE"] = "IDLE"
+    phase: ModePhase = "LOCKED"
     dwell: int = 0
-    done_steps: int = 0
-    # Book‑keeping for residuals (if x_mean available)
-    last_k: Optional[int] = None
-    last_x: Optional[float] = None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Controller
@@ -120,54 +95,63 @@ class _RungState:
 
 class RungController:
     """
-    RungController — non‑intrusive, on‑demand rung control.
+    Non‑intrusive rung control that blends tiny overrides onto the Supervisor.
 
-    Usage (one line in your loop):
-        ctrl_sup = sup.update(tele)
-        ctrl_out = rung.update(tele, ctrl_sup)
+    Typical use in a training loop:
+        ctrl_sup = sup.update(tele)                # Supervisor (baseline policy)
+        ctrl_out = rung.update(tele, ctrl_sup)     # small rung‑aware nudge
         model.apply_control(**ctrl_out)
 
-    Notes for non‑experts:
-      • You don’t have to pass every telemetry key; it will work with κ (kappa)
-        and p½ (p_half) alone. If you also provide x_mean (average ledger X),
-        the rung index/residuals are computed more precisely.
-
-      • “Hold” gently increases damping (γ) and centers you on the rung.
-        “Step” lowers damping, increases exposure (β), waits until p½ shows
-        you’re over the ridge, then increases damping to lock the next rung.
-
-      • If you never set an intent (default), it behaves like a wire: it
-        simply returns the Supervisor’s control unchanged.
+    Arguments
+    ---------
+    delta: float
+        δ⋆ — the nominal rung spacing in the hidden log variable X.
+    k_target: Optional[int]
+        Target rung index for SEEK/HOLD strategies; ignored for STABILIZE.
+    band: Optional[float]
+        Acceptance half‑band in X. If None, uses epsilon_scale * δ⋆.
+    intent: RungIntent | str
+        High‑level policy ("stabilize" | "hold" | "seek"). Default: STABILIZE.
+    tuning: Optional[RungTuning]
+        Tunable safe defaults for blending and rails.
     """
 
     def __init__(self,
                  delta: float,
-                 intent: Optional[RungIntent] = None,
+                 k_target: Optional[int] = None,
+                 band: Optional[float] = None,
+                 intent: Union[RungIntent, str, None] = None,
                  tuning: Optional[RungTuning] = None):
         self.delta = float(delta)
-        self.intent = intent or RungIntent("passthrough", 0)
+        self.k_target = k_target
+        self.band = band  # absolute band in X; if None, we derive from epsilon_scale
+        self.intent = _as_intent(intent)
         self.tuning = tuning or RungTuning()
         self.state = _RungState()
 
     # ——— public API ————————————————————————————————————————————————
 
-    def set_intent(self, mode: Mode, steps: int = 0) -> None:
-        """Change the goal on the fly (safe during training or inference)."""
-        self.intent = RungIntent(mode=mode, steps=max(0, int(steps)))
-        self._reset_fsm()
+    def set_intent(self,
+                   intent: Union[RungIntent, str],
+                   k_target: Optional[int] = None) -> None:
+        self.intent = _as_intent(intent)
+        if k_target is not None:
+            self.k_target = int(k_target)
+        self.state = _RungState(phase="LOCKED", dwell=0)
 
     def clear(self) -> None:
-        """Return to passthrough; state machine resets."""
-        self.set_intent("passthrough", steps=0)
+        """Return to STABILIZE; state machine resets."""
+        self.set_intent(RungIntent.STABILIZE, k_target=None)
 
     def status(self) -> Dict[str, object]:
         """Tiny JSON‑like snapshot (nice to print in Studio)."""
         return {
-            "mode": self.intent.mode,
-            "remaining_steps": self.intent.steps,
+            "intent": self.intent.value,
+            "target_k": self.k_target,
             "phase": self.state.phase,
             "dwell": self.state.dwell,
-            "delta": self.delta
+            "delta": self.delta,
+            "band": self._epsilon()
         }
 
     # ——— main hook ————————————————————————————————————————————————
@@ -179,17 +163,13 @@ class RungController:
         """
         Called once per training/inference step.
 
-        tele  — coherence metrics; best‑effort keys used:
-                'delta'|'δ⋆', 'kappa'|'κ', 'p_half'|'p½', 'x_mean'
+        tele — best‑effort keys used:
+            'delta'|'δ⋆', 'kappa'|'κ', 'p_half'|'p½', 'x_mean'
         ctrl_from_supervisor — existing {beta,gamma,clamp} suggestion;
-                we blend toward our targets; if None, we start from {1.0,0.5,5.0}.
+            we blend toward our targets; if None, we start from {1.0,0.5,5.0}.
         """
         # 0) Safe defaults
         ctrl = dict(ctrl_from_supervisor or {"beta": 1.0, "gamma": 0.5, "clamp": 5.0})
-
-        # Early exit when passthrough/off
-        if self.intent.mode in ("off", "passthrough"):
-            return ctrl
 
         # 1) Read telemetry (best‑effort, tolerant to missing keys)
         delta = float(tele.get("delta", tele.get("δ⋆", self.delta)))
@@ -200,32 +180,52 @@ class RungController:
         p_half = tele.get("p_half", tele.get("p½", None))
         x_mean = tele.get("x_mean", None)  # optional but helpful
 
-        # 2) Decide targets from mode + state
-        if self.intent.mode == "hold":
-            target = self._target_hold(kappa, p_half)
+        # Infer k index & residual when possible
+        k_now, r = None, None
+        if x_mean is not None:
+            k_now = self._nearest_k(x_mean)
+            r = x_mean - k_now * self.delta
+
+        # 2) Policy
+        if self.intent == RungIntent.STABILIZE:
+            # Keep within acceptance band; increase damping near barriers.
+            target = self._target_stabilize(p_half=p_half)
             return self._blend(ctrl, target, self.tuning.blend_hold)
 
-        if self.intent.mode in ("step_up", "step_down"):
-            target, completed = self._target_step(direction=+1 if self.intent.mode == "step_up" else -1,
-                                                  kappa=kappa, p_half=p_half, x_mean=x_mean)
+        if self.intent == RungIntent.HOLD:
+            # Gently center on the nearest rung and keep it quiet.
+            target = self._target_hold(p_half=p_half)
+            return self._blend(ctrl, target, self.tuning.blend_hold)
+
+        if self.intent == RungIntent.SEEK:
+            # Walk toward a target rung if provided; otherwise behave like HOLD.
+            if self.k_target is None or k_now is None:
+                target = self._target_hold(p_half=p_half)
+                return self._blend(ctrl, target, self.tuning.blend_hold)
+
+            dirn = 0
+            if self.k_target > k_now:
+                dirn = +1
+            elif self.k_target < k_now:
+                dirn = -1
+
+            target, completed = self._target_step(direction=dirn, p_half=p_half, r=r, kappa=kappa)
             out = self._blend(ctrl, target, target.pop("_blend", self.tuning.blend_cross))
-            if completed:
-                # Count the click and either continue or fall back to "hold"
-                self.intent.steps = max(0, self.intent.steps - 1)
-                if self.intent.steps == 0:
-                    self.intent.mode = "hold"
-                    self._reset_fsm(to="LOCKED")
+
+            # If we've arrived, automatically switch to HOLD
+            if dirn == 0 and completed:
+                self.intent = RungIntent.HOLD
+                self.state = _RungState(phase="LOCKED", dwell=0)
             return out
 
-        # Unknown mode → passthrough
+        # Fallback
         return ctrl
 
     # ——— internal helpers ———————————————————————————————————————————
 
-    def _reset_fsm(self, to: _RungState["phase"].__args__ = "IDLE") -> None:
-        self.state = _RungState(phase=to, dwell=0, done_steps=0, last_k=None, last_x=None)
-
     def _epsilon(self) -> float:
+        if self.band is not None:
+            return float(self.band)
         return self.tuning.epsilon_scale * self.delta
 
     def _nearest_k(self, x_mean: float) -> int:
@@ -247,59 +247,57 @@ class RungController:
         clamp = (1 - w) * base.get("clamp", 5.0) + w * target.get("clamp", 5.0)
         return self._clip(beta, gamma, clamp)
 
-    # ——— HOLD (keep nearest rung centered) —————————————————————————
+    # ——— policies ————————————————————————————————————————————————
 
-    def _target_hold(self, kappa: float, p_half: Optional[float]) -> Dict[str, float]:
+    def _target_stabilize(self, p_half: Optional[float]) -> Dict[str, float]:
         """
-        Simple, gentle centering:
+        Stabilize around rungs without forcing tight centering.
+        Closer to a barrier (p½≈0.5) → keep damping higher; away → moderate.
+        """
+        T = self.tuning
+        if p_half is None:
+            gamma = 0.5 * (T.gamma_damp_lo + T.gamma_damp_hi)
+        else:
+            # Peak damping near barrier (p½~0.5), taper toward center
+            # Map p_half∈[0,0.5]∪[0.5,1] to a “nearness to barrier” score
+            d = abs(0.5 - float(p_half))
+            nearness = 1.0 - min(max(d / 0.5, 0.0), 1.0)
+            gamma = T.gamma_damp_lo + nearness * (T.gamma_damp_hi - T.gamma_damp_lo)
+        return {"beta": T.beta_hold, "gamma": gamma, "clamp": T.clamp_safe}
+
+    def _target_hold(self, p_half: Optional[float]) -> Dict[str, float]:
+        """
+        Gentle, sticky centering on the nearest rung:
           • slightly higher damping (γ) to absorb chatter,
           • modest β to keep responsiveness,
           • clamp at a safe value.
         """
         T = self.tuning
-        # If p_half says we’re far from the barrier, use a bit more damping; else, stay nimble
         gamma = T.gamma_damp_hi if (p_half is None or p_half < 0.25) else 0.5 * (T.gamma_damp_lo + T.gamma_damp_hi)
         return {"beta": T.beta_hold, "gamma": gamma, "clamp": T.clamp_safe}
 
-    # ——— STEP (cross barrier then capture) ——————————————————————————
-
     def _target_step(self,
                      direction: int,
-                     kappa: float,
                      p_half: Optional[float],
-                     x_mean: Optional[float]) -> tuple[Dict[str, float], bool]:
+                     r: Optional[float],
+                     kappa: float) -> tuple[Dict[str, float], bool]:
         """
-        State machine:
-            LOCKED   → (lower γ, raise β) → MID (approach barrier)
-            MID      → (β↑, γ↓) hold mid dwell → CROSSING
-            CROSSING → once p_half high or residual shows crossing, go CAPTURE
-            CAPTURE  → γ↑ (damping), clamp safe; after dwell, count +1 step
+        Cross a barrier in the chosen direction and then re‑lock.
         Returns: (target_control, completed: bool)
         """
         T = self.tuning
-        eps = self._epsilon()
 
-        # Heuristics when x_mean is available (preferred)
-        k_now, r = None, None
-        if x_mean is not None:
-            k_now = self._nearest_k(x_mean)
-            r = x_mean - k_now * self.delta  # absolute residual (±)
-
-        # Phase transitions (no hard dependence on x_mean)
-        if self.state.phase in ("IDLE",):
-            self.state.phase = "LOCKED"
-            self.state.dwell = 0
-
-        # Decide with p_half if available; otherwise rely on dwell + kappa
+        # Decide via p_half if available; otherwise rely on r (residual) and κ (confidence)
         at_mid = (p_half is not None and p_half >= 0.48) or (r is not None and abs(r) >= 0.45 * self.delta)
         well_locked = (p_half is not None and p_half <= T.p_half_lock) or (kappa >= 0.20)
 
+        # Phase machine
         if self.state.phase == "LOCKED":
+            if direction == 0:
+                # We are already at target; finished
+                return {"beta": T.beta_hold, "gamma": T.gamma_damp_hi, "clamp": T.clamp_safe, "_blend": T.blend_hold}, True
             # Start leaning toward the barrier in the chosen direction
-            self.state.dwell = 0
-            if at_mid:
-                self.state.phase = "MID"
-            # Target: cross‑friendly set (nimble)
+            self.state.phase = "MID" if at_mid else "LOCKED"
             return {"beta": T.beta_boost, "gamma": T.gamma_damp_lo, "clamp": T.clamp_safe, "_blend": T.blend_cross}, False
 
         if self.state.phase == "MID":
@@ -332,15 +330,15 @@ class RungController:
 
         if self.state.phase == "CAPTURE":
             self.state.dwell += 1
-            # We consider the new rung "locked" once p_half is small (or κ recovered)
             if self.state.dwell >= T.dwell_lock and well_locked:
-                # completed one click
+                # Completed capture of the next rung
                 self.state.phase = "LOCKED"
                 self.state.dwell = 0
-                self.state.done_steps += 1
                 return {"beta": T.beta_hold, "gamma": T.gamma_damp_hi, "clamp": T.clamp_safe, "_blend": T.blend_hold}, True
             # Keep damping up during capture
             return {"beta": T.beta_hold, "gamma": T.gamma_damp_hi, "clamp": T.clamp_safe, "_blend": T.blend_capture}, False
 
         # Fallback
+        self.state.phase = "LOCKED"
+        self.state.dwell = 0
         return {"beta": T.beta_hold, "gamma": T.gamma_damp_hi, "clamp": T.clamp_safe, "_blend": T.blend_hold}, False
