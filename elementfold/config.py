@@ -4,7 +4,7 @@
 # provides helpers so callers can serialize/deserialize configs cleanly.
 
 from __future__ import annotations                           # Forward annotations (older Python)
-from dataclasses import dataclass, asdict, field             # Typed, lightweight config container
+from dataclasses import dataclass, asdict                    # Typed, lightweight config container
 from typing import Tuple, Optional, Dict, Any                # Minimal typing for clarity
 import json                                                  # JSON (text) ↔ dict conversion
 
@@ -12,7 +12,7 @@ import json                                                  # JSON (text) ↔ d
 @dataclass
 class Config:
     # — core training/runtime knobs —
-    device: str = "cuda"                                     # 'cuda' | 'cpu' (training loop also accepts None → auto)
+    device: str | None = "cuda"                              # 'cuda' | 'cpu' | None (auto) — loop also accepts None
     steps: int = 200                                         # total optimization steps
     vocab: int = 256                                         # tokenizer/model vocabulary size
     d: int = 128                                             # feature width
@@ -29,6 +29,10 @@ class Config:
     lang_ckpt: Optional[str] = None                          # path to language steering/model ckpt
     vision_ckpt: Optional[str] = None                        # path to vision steering/model ckpt
     audio_ckpt: Optional[str] = None                         # path to audio steering/model ckpt
+
+    # Ensure sensible values even when constructed directly (not only via from_dict).
+    def __post_init__(self) -> None:
+        self._validate()
 
     # — helpers: dictionary → kwargs for train_loop —
     def to_kwargs(self) -> Dict[str, Any]:
@@ -73,9 +77,7 @@ class Config:
         # Filter only fields declared on the dataclass
         valid = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         filtered = {k: d[k] for k in d.keys() if k in valid}
-        cfg = cls(**filtered)
-        cfg._validate()  # ensure values are sensible
-        return cfg
+        return cls(**filtered)  # __post_init__ will validate
 
     # — load from JSON text (pairs with to_json) —
     @classmethod
@@ -86,6 +88,24 @@ class Config:
         except Exception as e:
             raise ValueError(f"Config.from_json: invalid JSON ({e})")
         return cls.from_dict(payload)
+
+    # — tiny convenience: file I/O (optional) —
+    @classmethod
+    def load(cls, path: str, encoding: str = "utf-8") -> "Config":
+        """Read JSON config from a file path."""
+        with open(path, "r", encoding=encoding) as f:
+            return cls.from_json(f.read())
+
+    def save(self, path: str, indent: int = 2, encoding: str = "utf-8") -> None:
+        """Write JSON config to a file path (pretty)."""
+        # Local import to avoid any import cycles at module import time.
+        try:
+            from .utils.io import write_text  # type: ignore
+            write_text(path, self.to_json(indent=indent))
+        except Exception:
+            # If utils.io isn’t available in this context, fall back to stdlib.
+            with open(path, "w", encoding=encoding) as f:
+                f.write(self.to_json(indent=indent))
 
     # — internal sanity checks (kept gentle) —
     def _validate(self) -> None:
@@ -106,7 +126,7 @@ class Config:
         self.capacities = tuple(max(1, int(c)) for c in self.capacities)
         # device: normalize common variants
         dev = (self.device or "").strip().lower()
-        if dev in ("auto", "autodetect", "default"):
+        if dev in ("auto", "autodetect", "default", ""):
             self.device = None  # let the training loop pick
         elif dev in ("cuda", "gpu", "cuda:0"):
             self.device = "cuda"
