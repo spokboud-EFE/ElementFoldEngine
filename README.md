@@ -7,6 +7,7 @@ This work is publicly available exclusively for non-profit organizations.
 
 Join Discord Channel
 [SRT DISCORD](https://discord.gg/nzyWctG2)
-(EFE Theory)(https://doi.org/10.5281/zenodo.17481738)
+
+[EFE Theory](https://doi.org/10.5281/zenodo.17481738)
 
 
