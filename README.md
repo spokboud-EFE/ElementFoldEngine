@@ -5,11 +5,11 @@ Proving that coherence itself can be engineered as the new foundation of intelli
 
 This work is publicly available exclusively for non-profit organizations.
 
-Join Discord Channel ---> [SRT DISCORD](https://discord.gg/nzyWctG2)
+Discord Channel ---> [SRT DISCORD](https://discord.gg/nzyWctG2)
 
-Revise Theory ---> [EFE Theory](https://doi.org/10.5281/zenodo.17481738)
+Theory ---> [EFE Theory](https://doi.org/10.5281/zenodo.17481738)
 
-Confirming Legacy ---> [![DOI](https://zenodo.org/badge/1086358952.svg)](https://doi.org/10.5281/zenodo.17518213)
+Legacy (Deprecated) ---> [![DOI](https://zenodo.org/badge/1086358952.svg)](https://doi.org/10.5281/zenodo.17518213)
 
 
 
