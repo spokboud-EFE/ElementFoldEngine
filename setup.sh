@@ -83,3 +83,35 @@ python -m elementfold --help
 #    ctrl = r.update(tele, {"beta":1.0,"gamma":0.5,"clamp":5.0})
 #    print(f"step {step:02d} | ctrl={ctrl} | state={r.status()['phase']}")
 #PY
+
+
+## Studio
+#python -m elementfold studio
+## In Studio:
+#> /mod resonator
+#> help
+#> init δ=0.5
+#> hold
+#> tick 5
+#> step up 2
+#> status
+
+#from elementfold.experience.adapters.base import AdapterRegistry
+#run = AdapterRegistry.get("resonator")()
+#print(run(None, "init δ=0.5"))
+#print(run(None, "hold"))
+#print(run(None, "tick 6"))
+#print(run(None, "step up 1"))
+#print(run(None, "status"))
+
+#(inside studio)
+#help                 — show commands
+#status               — controller + driver snapshot
+#init δ=<value>       — reset and set δ⋆
+#hold                 — keep nearest rung
+#step up [N]          — cross upward N clicks
+#step down [N]        — cross downward N clicks
+#delta <value>        — change δ⋆ live
+#tick [N]             — run N control ticks
+#driver sim|null      — switch driver
+
