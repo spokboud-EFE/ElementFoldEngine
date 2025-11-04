@@ -60,4 +60,4 @@ conda activate elementfold
 ## (5) Sanity check
 #python -V
 #python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"
-
+python -m elementfold --help
