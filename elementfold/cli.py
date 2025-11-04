@@ -39,6 +39,7 @@ try:
 except Exception:
     _HAS_RICH = False
 
+
 # --------------------------- Helpers ---------------------------
 
 def _parse_caps(s: str | None) -> Tuple[int, ...]:
@@ -67,7 +68,7 @@ def _coerce_device(choice: str | None) -> str | None:
 
 def _cfg_with_extras(cfg: Config, **extras: Any) -> Config:
     """
-    Ensure new flags (print_every, out, etc.) reach the training loop even if
+    Ensure new flags (print_every, out, rung_*) reach the training loop even if
     Config.to_kwargs() doesn’t yet include them. We wrap to_kwargs() at runtime.
     """
     base = cfg.to_kwargs() if hasattr(cfg, "to_kwargs") else dict(vars(cfg))
@@ -133,7 +134,6 @@ def _print_kv(title: str, kv: Dict[str, Any]) -> None:
 
 def _preflight_summary(kind: str, cfg: Config) -> None:
     """Give a short narrative summary before running."""
-    # Pull the bits users care about most.
     caps = getattr(cfg, "capacities", (2, 6, 10, 14))
     kv = {
         "device": getattr(cfg, "device", None) or "auto (CUDA if available, else CPU)",
@@ -144,6 +144,13 @@ def _preflight_summary(kind: str, cfg: Config) -> None:
         "capacities": ",".join(map(str, caps)) if isinstance(caps, (tuple, list)) else str(caps),
         "data": "DataLoader" if getattr(cfg, "use_data", True) else "synthetic tokens",
     }
+    # Rung extras if present
+    if hasattr(cfg, "rung_intent"):
+        kv["rung_intent"] = getattr(cfg, "rung_intent")
+    if hasattr(cfg, "rung_band"):
+        kv["rung_band"] = getattr(cfg, "rung_band")
+    if hasattr(cfg, "rung_loss_weight"):
+        kv["rung_loss_weight"] = getattr(cfg, "rung_loss_weight")
     _print_kv(f"⟲ ElementFold • {kind}", kv)
 
 
@@ -224,6 +231,16 @@ def main() -> None:
     pt.add_argument("--no-data", action="store_true",
                     help="Disable the DataLoader and use synthetic tokens (fast smoke test).")
 
+    # ★ Rung controller (center‑stage) — train-time controls
+    pt.add_argument("--rung-intent", type=str, choices=("stabilize", "seek", "hold"), default="stabilize",
+                    help="Rung strategy: stabilize near rungs, seek safe disalignment, or hold tight.")
+    pt.add_argument("--rung-target-k", type=int, default=None,
+                    help="Optional target rung index (mainly for HOLD/SEEK experiments).")
+    pt.add_argument("--rung-band", type=float, default=None,
+                    help="Acceptance half‑band in X (default: δ⋆/6 if omitted).")
+    pt.add_argument("--rung-loss-weight", type=float, default=0.0,
+                    help="Optional loss shaping weight; 0.0 disables rung penalty.")
+
     # --------------------- Infer ---------------------
     pi = sub.add_parser(
         "infer",
@@ -260,6 +277,12 @@ def main() -> None:
     pi.add_argument("--no-data", action="store_true", help="Use synthetic tokens (fast smoke test).")
     pi.add_argument("--out", type=str, default=None,
                     help="If training happens here, optionally save the resulting checkpoint (same rules as train --out).")
+    # ★ Rung controller flags also apply to the temporary training path
+    pi.add_argument("--rung-intent", type=str, choices=("stabilize", "seek", "hold"), default="stabilize",
+                    help="Rung strategy during quick train if no --ckpt is provided.")
+    pi.add_argument("--rung-target-k", type=int, default=None, help="Target rung for quick train.")
+    pi.add_argument("--rung-band", type=float, default=None, help="Acceptance half‑band in X for quick train.")
+    pi.add_argument("--rung-loss-weight", type=float, default=0.0, help="Rung loss weight for quick train.")
 
     # --------------------- Studio ---------------------
     ps = sub.add_parser("studio", help="Interactive steering Studio (terminal)")
@@ -291,7 +314,6 @@ def main() -> None:
     if args.cmd == "doctor":
         rep = _env_report()
         _print_kv("ElementFold • environment", rep)
-        # nudge
         if rep.get("cuda_available") is False:
             print("Tip: For GPUs, install the matching NVIDIA driver and a CUDA‑enabled PyTorch build.")
         return
@@ -299,25 +321,36 @@ def main() -> None:
     if args.cmd == "train":
         # Apply config defaults (if any), respecting explicit flags.
         cfg_dict = _load_config_file(args.config)
-        # keys we accept from config files
-        cfg_keys = ("steps", "seq_len", "vocab", "d", "layers", "heads", "batch", "fold", "delta", "capacities", "use_data")
+        cfg_keys = (
+            "steps", "seq_len", "vocab", "d", "layers", "heads", "batch",
+            "fold", "delta", "capacities", "use_data",
+            # ★ allow rung defaults in config files too
+            "rung_intent", "rung_target_k", "rung_band", "rung_loss_weight",
+        )
         _apply_config_defaults(args, cfg_dict, cfg_keys)
 
         out_arg = args.out or args.save
         device = _coerce_device(args.device)
 
         if args.resume:
-            # Continue training from a saved Engine checkpoint (uses saved config)
             if not Path(args.resume).exists():
                 raise FileNotFoundError(f"resume checkpoint not found: {args.resume}")
             eng = Engine.from_checkpoint(args.resume)
-            # Optionally override runtime extras (print_every/out) on resume
-            eng.cfg = _cfg_with_extras(eng.cfg, print_every=args.print_every, out=out_arg)
+            # Merge runtime extras, including rung controls (override saved config if provided)
+            eng.cfg = _cfg_with_extras(
+                eng.cfg,
+                print_every=args.print_every,
+                out=out_arg,
+                rung_intent=args.rung_intent,
+                rung_target_k=args.rung_target_k,
+                rung_band=args.rung_band,
+                rung_loss_weight=args.rung_loss_weight,
+            )
             _preflight_summary("resume", eng.cfg)
             eng.fit()
             return
 
-        # Build fresh config
+        # Fresh config
         cfg = Config(
             device=device,
             steps=args.steps if args.steps is not None else 200,
@@ -332,7 +365,15 @@ def main() -> None:
             batch=args.batch if args.batch is not None else 32,
             use_data=not args.no_data,
         )
-        cfg = _cfg_with_extras(cfg, print_every=args.print_every, out=out_arg)
+        cfg = _cfg_with_extras(
+            cfg,
+            print_every=args.print_every,
+            out=out_arg,
+            rung_intent=args.rung_intent,
+            rung_target_k=args.rung_target_k,
+            rung_band=args.rung_band,
+            rung_loss_weight=args.rung_loss_weight,
+        )
 
         _preflight_summary("train", cfg)
 
@@ -353,7 +394,12 @@ def main() -> None:
         else:
             # Quick train‑then‑infer path
             cfg_dict = _load_config_file(args.config)
-            cfg_keys = ("steps", "seq_len", "vocab", "d", "layers", "heads", "batch", "fold", "delta", "capacities", "use_data")
+            cfg_keys = (
+                "steps", "seq_len", "vocab", "d", "layers", "heads", "batch",
+                "fold", "delta", "capacities", "use_data",
+                # ★ rung defaults for quick training
+                "rung_intent", "rung_target_k", "rung_band", "rung_loss_weight",
+            )
             _apply_config_defaults(args, cfg_dict, cfg_keys)
 
             device = _coerce_device(args.device)
@@ -371,7 +417,15 @@ def main() -> None:
                 batch=args.batch if args.batch is not None else 32,
                 use_data=not args.no_data,
             )
-            cfg = _cfg_with_extras(cfg, print_every=args.print_every, out=args.out)
+            cfg = _cfg_with_extras(
+                cfg,
+                print_every=args.print_every,
+                out=args.out,
+                rung_intent=args.rung_intent,
+                rung_target_k=args.rung_target_k,
+                rung_band=args.rung_band,
+                rung_loss_weight=args.rung_loss_weight,
+            )
             _preflight_summary("infer (quick train)", cfg)
             eng = Engine(cfg)
             eng.fit()
@@ -402,7 +456,6 @@ def main() -> None:
     if args.cmd == "steering-train":
         from .experience.steering_train import fit_steering
         device = _coerce_device(args.device)
-        # The controller trainer accepts these directly
         ctrl = fit_steering(
             steps=args.steps,
             lr=args.lr,
