@@ -1,1 +1,2 @@
-../ElementFold/.idea
+*.idea*
+*pycache*
