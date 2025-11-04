@@ -43,6 +43,7 @@ dependencies:
   - pip
   - pip:
       - setuptools>=70      # fix for _distutils_hack
+      - rich
 EOF
 
 # (1) Make sure conda shell hooks are loaded for 'conda activate' in this shell
@@ -61,3 +62,22 @@ conda activate elementfold
 #python -V
 #python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"
 python -m elementfold --help
+# 1) Environment check
+#python -m elementfold doctor
+#
+## 2) Train with a config file (TOML) and override a couple params
+#python -m elementfold train --config configs/small.toml --steps 400 --print-every 100 --out runs/small_01
+#
+## 3) Train the steering controller
+#python -m elementfold steering-train --steps 800 --print-every 100 --out runs/steering/ctrl.pt
+#
+## 4) Infer from your run
+#python -m elementfold infer --ckpt runs/test1/checkpoint.pt --prompt "A calm introduction..."
+
+
+#python - <<'PY'
+#import torch
+#print("Torch version:", torch.__version__)
+#print("CUDA available?", torch.cuda.is_available())
+#print("MPS (Apple Metal) available?", torch.backends.mps.is_available())
+#PY

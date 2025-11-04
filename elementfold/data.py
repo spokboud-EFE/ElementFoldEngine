@@ -1,5 +1,5 @@
 # ElementFold · data.py
-# A tiny, friendly data pipeline that yields token batches for training.
+# A tiny, data pipeline that yields token batches for training.
 # We keep it dependency‑free and readable:
 #   • PulseDataset — synthesizes sequences with simple “pulse” structure
 #                    aligned to the ledger capacities (2, 6, 10, 14).

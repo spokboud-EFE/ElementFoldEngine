@@ -13,7 +13,16 @@
 #   5) We measure coherence (κ, p½, margins) and let the Supervisor nudge β, γ, and ⛔.
 #   6) We push those controls into the model (apply_control) so the next step is more stable.
 
+from __future__ import annotations
+
+import math
+import sys
+import time
+from pathlib import Path
+from typing import Dict, Any
+
 import torch                                     # Tensors, CUDA checks
+import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_       # Safety clamp on ∥∇∥
 from .model import Model                         # The coherent core (RotaryClick + FGN stack)
 from .align import AlignHead                     # Temperature‑free contrastive alignment
@@ -22,7 +31,57 @@ from .telemetry import measure                   # κ, p½, margins, residual st
 from .optim import build_optimizer, make_scheduler, get_lr  # AdamW + warmup/cosine schedule
 from .control import Supervisor                  # Feedback controller for β, γ, ⛔
 from .data import DataLoaderBuilder              # Minimal data source (or synth)
+from .rung_controller import RungController, RungIntent
 
+# ——————————————————————————————————————————————————————————————————————————
+# Small, dependency‑free UI helpers (Unicode‑aware; safe ASCII fallback)
+# ——————————————————————————————————————————————————————————————————————————
+
+def _supports_unicode() -> bool:
+    enc = getattr(sys.stdout, "encoding", "") or ""
+    return "UTF" in enc.upper()
+
+
+def _glyphs(use_unicode: bool) -> Dict[str, str]:
+    if use_unicode:
+        return {
+            "spin": "⟲", "ok": "✓", "warn": "⚠", "save": "💾",
+            "beta": "β", "gamma": "γ", "clamp": "⛔", "delta": "δ⋆",
+            "kappa": "κ", "phalf": "p½", "grad": "∥∇∥", "bolt": "⚡",
+            "dot": "•", "bar_full": "▰", "bar_empty": "▱",
+        }
+    else:
+        return {
+            "spin": "*", "ok": "OK", "warn": "!", "save": "SAVE",
+            "beta": "beta", "gamma": "gamma", "clamp": "CLAMP", "delta": "delta*",
+            "kappa": "kappa", "phalf": "p_half", "grad": "||grad||", "bolt": ">",
+            "dot": "-", "bar_full": "#", "bar_empty": "-",
+        }
+
+
+def _bar(frac: float, width: int, g: Dict[str, str]) -> str:
+    frac = max(0.0, min(1.0, float(frac)))
+    full = int(round(frac * width))
+    empty = width - full
+    return "[" + (g["bar_full"] * full) + (g["bar_empty"] * empty) + f"] {int(frac * 100):3d}%"
+
+
+def _fmt(x: float | int | None, digits: int = 4) -> str:
+    if x is None:
+        return "—"
+    if isinstance(x, int):
+        return f"{x}"
+    try:
+        if abs(x) >= 1e3 or (0 < abs(x) < 1e-3):
+            return f"{x:.2e}"
+        return f"{x:.{digits}f}"
+    except Exception:
+        return str(x)
+
+
+# ——————————————————————————————————————————————————————————————————————————
+# Training loop (adds friendly logging + save path + theory links)
+# ——————————————————————————————————————————————————————————————————————————
 
 def train_loop(
     device=None,                                 # Which accelerator? Auto‑select if None.
@@ -36,8 +95,13 @@ def train_loop(
     warmup_frac=0.1,                             # Fraction of steps used for warmup before cosine decay.
     clip_norm=1.0,                               # Gradient norm clamp for safety.
     tv_weight=0.0,                               # Total‑variation weight in the variational energy.
+
+    # New quality‑of‑life knobs:
+    out: str | None = None,                      # File or directory to save a checkpoint. If dir → checkpoint.pt
+    print_every: int | None = None,              # e.g., 50 → log every 50 steps; None → silent loop
+    ui: str = "auto",                            # "unicode" | "ascii" | "auto"
 ):
-    """
+    r"""
     ⟲ ElementFold training loop — *why these numbers* (defaults chosen for stability & portability).
 
     Device
@@ -142,31 +206,57 @@ def train_loop(
     • κ (kappa): |⟨e^{i·2πX/δ⋆}⟩| — higher means stronger phase concentration (more coherent).
     • p½: fraction near the half‑click boundary — if >5%, increase γ (damping) or tighten clamp.
 
+    Further reading (links)
+    -----------------------
+    • AdamW (Decoupled Weight Decay): https://arxiv.org/abs/1711.05101
+    • Cosine annealing / SGDR:       https://arxiv.org/abs/1608.03983
+    • Gradient clipping (theory):    https://proceedings.mlr.press/v28/pascanu13.html
+    • InfoNCE / contrastive losses:  https://arxiv.org/abs/1807.03748
+    • Total variation denoising:     https://en.wikipedia.org/wiki/Total_variation_denoising
+    • von Mises distribution (κ):    https://en.wikipedia.org/wiki/Von_Mises_distribution
+
+    Unicode vs ASCII output
+    -----------------------
+    • If your terminal can’t render Unicode, the logger automatically falls back to ASCII.
     """
 
-    # ——— 1) Pick device (CUDA if available) ————————————————————————————————
+    # ——— UI setup ——————————————————————————————————————————————
+    use_unicode = (_supports_unicode() if ui == "auto" else (ui == "unicode"))
+    g = _glyphs(use_unicode)
+    t0 = time.time()
+
+    # ——— 1) Pick device (CUDA if available) ——————————————————
     if device is None:                           # If caller didn’t specify a device …
         device = 'cuda' if torch.cuda.is_available() else 'cpu'  # … pick CUDA when possible.
 
-    # ——— 2) Build model and companions ————————————————————————————————
+    # ——— 2) Build model and companions ————————————————————
     model = Model(vocab=vocab, d=d, layers=layers, heads=heads, seq_len=seq_len, fold=fold, delta=delta).to(device)
     align = AlignHead(delta).to(device)          # Alignment head shares δ⋆ (temperature‑free geometry).
     var = VariationalLedger(delta, capacities, tv_weight=float(tv_weight)).to(device)  # Convex spacing energy.
 
-    # ——— 3) Optimizer + gentle LR schedule ————————————————————————————————
+    # ——— 3) Optimizer + gentle LR schedule ——————————————————
     opt = build_optimizer(model, lr=lr, wd=wd)   # AdamW with decay/no‑decay param groups.
     warmup_steps = max(1, int(warmup_frac * steps))                  # A small ramp to avoid cold starts.
     scheduler = make_scheduler(opt, warmup_steps=warmup_steps, total_steps=steps, min_lr_scale=0.1)  # Cosine after warmup.
 
-    # ——— 4) Supervisor (β exposure, γ damping, ⛔ clamp) ————————————————————
+    # ——— 4) Supervisor (β exposure, γ damping, ⛔ clamp) ——————
     sup = Supervisor()                           # Starts at β=1.0, γ=0.5, ⛔=5.0 by default.
-
-    # ——— 5) Data stream (or synthetic tokens) ————————————————————————————
+    rung = RungController(delta=delta)  # default: passthrough (no effect)
+    # ——— 5) Data stream (or synthetic tokens) ———————————————
     if use_data:
-        dl = DataLoaderBuilder(seq_len=seq_len, vocab=vocab, batch=batch).make()  # A tiny loader that yields (B,T) int64
+        dl = DataLoaderBuilder(seq_len=seq_len, vocab=vocab, batch=batch).make()  # Yields (B,T) int64
         it = iter(dl)                          # Create an iterator we can rewind on exhaustion.
 
-    # ——— 6) Optimization loop ————————————————————————————————————————————
+    # Header: greet the run
+    header = (
+        f"{g['spin']} ElementFold training  "
+        f"{g['dot']} device={device}  {g['dot']} {g['delta']}={_fmt(delta, 5)}  "
+        f"{g['dot']} d={d} L={layers} T={seq_len} b={batch}  "
+        f"{g['dot']} steps={steps}"
+    )
+    print(header)
+
+    # ——— 6) Optimization loop ————————————————————————————————
     for step in range(steps):
         # 6.a) Fetch a batch (wrap the iterator cleanly)
         if use_data:
@@ -176,15 +266,21 @@ def train_loop(
                 it = iter(dl)
                 x = next(it).to(device)
         else:
-            x = torch.randint(0, vocab, (batch, seq_len), device=device)  # Synthetic tokens (useful for smoke tests)
+            x = torch.randint(0, vocab, (batch, seq_len), device=device)  # Synthetic tokens (smoke test)
 
         # 6.b) Forward pass: logits and ledger scalars X per time step
         logits, X = model(x)                    # logits: (B,T,V), X: (B,T)
 
         # 6.c) Losses: task (CE), alignment (temperature‑free NCE), variational (convex energy)
-        loss_task = torch.nn.functional.cross_entropy(logits.view(-1, vocab), x.view(-1))  # Language modeling CE
-        loss_align, pos, neg = align(X.mean(dim=1), torch.as_tensor(capacities, device=device))  # κ‑based contrast
-        e = var.energy(X[:, :max(capacities)])  # Enforce equal seat spacing inside each block and δ⋆ across blocks
+        loss_task = F.cross_entropy(logits.reshape(-1, vocab), x.reshape(-1))  # Language modeling CE
+
+        caps_t = torch.as_tensor(capacities, device=device)
+        # Align on batch‑average phase summary to keep it simple & stable here
+        loss_align, pos, neg = align(X.mean(dim=1), caps_t)                    # returns (loss, pos, neg)
+
+        # Variational energy on the first max(capacities) seats along time (safe min with T)
+        maxcap = int(min(X.size(1), int(max(capacities)) if len(capacities) else X.size(1)))
+        e = var.energy(X[:, :maxcap])                                          # Convex spacing energy (scalar)
 
         # Combine with small weights so each term “speaks” but task remains primary
         loss = loss_task + 1.0 * loss_align + 0.1 * e / (batch * seq_len)
@@ -192,17 +288,51 @@ def train_loop(
         # 6.d) Backward pass with safety rails (zero‑grad → backprop → clip → step)
         opt.zero_grad(set_to_none=True)        # Drop old gradient buffers (faster than filling zeros)
         loss.backward()                        # Compute ∇ for all trainable parameters
-        grad_norm = float(clip_grad_norm_(model.parameters(), clip_norm))  # Clamp ∥∇∥₂ ≤ clip_norm; record for telemetry
+        grad_norm = float(clip_grad_norm_(model.parameters(), clip_norm))  # Clamp ∥∇∥₂ ≤ clip_norm
         opt.step()                              # AdamW update (decoupled weight decay)
         scheduler.step()                        # LR schedule tick (warmup → cosine)
 
         # 6.e) Read coherence telemetry (κ, p½, margins) and update Supervisor
         tele = measure(X.mean(dim=1), delta, detail=False)     # Summarize coherence per batch
+        tele["x_mean"] = float(X.mean().detach().mean().item())  # ← helps residual/rung logic
         tele["grad_norm"] = grad_norm                          # Add gradient norm for stability hints
-        ctrl = sup.update(tele)                                # Adjust β, γ, ⛔ recommendations
-        if hasattr(model, "apply_control"):                    # Push controls into the FGN blocks if supported
-            model.apply_control(beta=ctrl["beta"], gamma=ctrl["gamma"], clamp=ctrl["clamp"])
+        ctrl_sup = sup.update(tele)  # Supervisor’s suggestion,  # Adjust β, γ, ⛔ recommendations
+        ctrl_out = rung.update(tele, ctrl_sup)  # ← RungController overrides (only if asked)
+        if hasattr(model, "apply_control"): # Push controls into the FGN blocks if supported
+            model.apply_control(beta=ctrl_out["beta"], gamma=ctrl_out["gamma"], clamp=ctrl_out["clamp"])
 
-        # (Optional) Light on‑step prints could be added by caller; we keep core loop quiet by default.
+        # 6.f) Friendly progress log (if requested)
+        if print_every is not None and ((step + 1) % print_every == 0 or step == steps - 1):
+            frac = (step + 1) / max(1, steps)
+            lr_now = get_lr(opt)
+            bar = _bar(frac, width=24, g=g)
+            msg = (
+                f"{bar}  step {step+1}/{steps}  "
+                f"ℒ={_fmt(float(loss))}  "
+                f"{g['kappa']}={_fmt(tele.get('kappa'))}  "
+                f"{g['phalf']}={_fmt(tele.get('p_half'))}  "
+                f"{g['grad']}={_fmt(grad_norm, 2)}  "
+                f"{g['bolt']} lr={_fmt(lr_now, 2)}  "
+                f"β={_fmt(ctrl.get('beta'), 3)}  {g['gamma']}={_fmt(ctrl.get('gamma'), 3)}  {g['clamp']}={_fmt(ctrl.get('clamp'), 3)}"
+            )
+            print(msg)
+
+    # ——— Save checkpoint if requested —————————————————————————
+    if out is not None:
+        path = Path(out)
+        if path.is_dir() or not path.suffix:
+            path.mkdir(parents=True, exist_ok=True)
+            path = path / "checkpoint.pt"
+        torch.save(model.state_dict(), path)
+        print(f"{g['ok']} model saved to {path}")
+    else:
+        print(f"{g['ok']} training done (no checkpoint path provided)")
+
+    # Footer with quick theory links (won’t break anything if copied into logs)
+    if print_every is not None:
+        print(
+            "Refs: AdamW https://arxiv.org/abs/1711.05101  |  Cosine/SGDR https://arxiv.org/abs/1608.03983  |  "
+            "Clipping https://proceedings.mlr.press/v28/pascanu13.html  |  TV https://en.wikipedia.org/wiki/Total_variation_denoising"
+        )
 
     return model  # Trained model ready for inference or saving

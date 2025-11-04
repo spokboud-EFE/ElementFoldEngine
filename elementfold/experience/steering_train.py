@@ -9,6 +9,7 @@
 
 import math
 import random
+from pathlib import Path
 import torch, torch.nn as nn, torch.optim as optim      # tensors • modules • optimizers
 from .steering import SteeringController                # 🎚 intent → control vector
 
@@ -158,6 +159,13 @@ def fit_steering(
         m.load_state_dict(best_state)
     m.eval()
     if save_path is not None:
-        torch.save(m.state_dict(), save_path)
-
+        path = Path(save_path)
+        # Treat paths without an extension as directories by default
+        if path.is_dir() or not path.suffix:
+            path.mkdir(parents=True, exist_ok=True)
+            path = path / "checkpoint.pt"
+        torch.save(m.state_dict(), path)
+        print(f"✓ SteeringController saved to {path}")
+    else:
+        print("✓ SteeringController training done (no save path provided)")
     return m

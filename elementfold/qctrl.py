@@ -47,7 +47,7 @@ def compile_multiples(m: Sequence[int | float], delta: float, mod: bool = True) 
     th = theta_star(delta)                            # θ⋆ in radians
     angles = [float(k) * th for k in m]               # raw angles (no wrapping)
     if mod:
-        angles = [wrap_pi(a) for a in angles]         # hardware‑friendly range
+        angles = [wrap_pi(a) for a in angles]         # hardware range
     return angles                                     # list[float] radians
 
 

@@ -1,5 +1,5 @@
 # ElementFold · config.py
-# A tiny, typed configuration carrier with friendly JSON I/O.
+# A tiny, typed configuration carrier with JSON I/O.
 # It holds just the knobs the training loop needs (device, steps, d, …) and
 # provides helpers so callers can serialize/deserialize configs cleanly.
 
