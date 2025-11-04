@@ -6,3 +6,60 @@ Proving that coherence itself can be engineered as the new foundation of intelli
 This work is publicly available exclusively for non-profit organizations.
 
 ElementFold, in its completed tighter form, is a coherence engine rather than a stack of models: a single, disciplined system that learns, reasons, and serves by keeping signals in tune with themselves across depth, devices, and domains. The core runs on a temperature‑free learning loop that aligns representations by their phase relationships at a fixed click‑scale, so there is no guesswork about softness or margins—coherence is the scale. Around that core sits a family of fold operators for grids, graphs, sequences, images, audio, molecules, and mixed geometry, all following the same fold–gate–normalize contract so the network accumulates identity, exposes novelty in bounded steps, and re‑balances automatically. A seat‑harmonic algebra makes the system introspective: every layer can decompose its own activity into fundamental and overtone patterns, report concentration and violations, and prove closure along cycles, so stability is observable, not assumed. The orchestration plane turns those readings into action, adjusting exposure and damping in real time and coordinating many engines across GPUs and nodes through a resonator mesh that shares a slow control rhythm; clusters phase‑lock like a single instrument while staying modular and fault tolerant. A quantum backend compiles clean multiples of the base angle into palindromic gate schedules and synchronizes logical phases with the classical runtime, so hybrid execution follows one timing law end‑to‑end. Adapters make modality boundaries disappear: text uses rotary click embeddings and attention folds, vision uses convolutional folds with perceptual gates, audio folds in spectro‑temporal neighborhoods, graphs and lattices carry chemistry and materials structure, and a cross‑modal adapter aligns them without forcing everything into one brittle embedding space. A pretrained steering model reads user intent and telemetry to pick modes, folds, norms, and precision, blends specialized submodels as an ensemble when needed, and applies stylometric guidance so outputs match purpose and tone without manual knobs. Element prediction becomes a first‑class application: lattice fingerprints learned by the engine map directly to properties like cohesion, conductivity, and refractive response, and the same machinery routes power in simulated devices, schedules resonant cavities, or stabilizes sensor clocks in a distributed network. For developers and operators, the experience feels like using an operating system for coherence: a thin SDK to compose folds and launch jobs, a service that exports models to standard runtimes and quantum IRs, a telemetry stream that feeds a live dashboard showing phase maps, half‑click margins, exposure and health, and a Studio that turns natural language into orchestrated runs—“align these clocks,” “train element coherence on this corpus,” “serve as a guidance layer over this backbone”—with safe defaults and guardrails derived from invariants rather than heuristics. The theory closes the loop with a simple action principle for the fold process, connecting learning dynamics to energy balance so that convergence and robustness are not just empirical but structural. The result is a unified, production‑grade system that treats coherence as a resource you can allocate, conserve, and trade: it scales from a single device to a resonant cluster, fuses modalities without friction, partners cleanly with quantum hardware, and delivers predictions and generation with the calm reliability of engineered rhythm.
+
+
+## Usage
+```bash
+python -m elementfold --help
+
+#python - <<'PY'
+#import torch
+#print("Torch version:", torch.__version__)
+#print("CUDA available?", torch.cuda.is_available())
+#print("MPS (Apple Metal) available?", torch.backends.mps.is_available())
+#PY
+
+
+#python - <<'PY'
+#from elementfold.rung_controller import RungController, RungIntent
+#
+#r = RungController(delta=0.5, intent=RungIntent.SEEK, k_target=3)
+#
+#print("Initial:", r.status())
+#for step in range(12):
+#    tele = {"κ":0.3, "p½":0.45, "x_mean": step*0.25}
+#    ctrl = r.update(tele, {"beta":1.0,"gamma":0.5,"clamp":5.0})
+#    print(f"step {step:02d} | ctrl={ctrl} | state={r.status()['phase']}")
+#PY
+
+
+## Studio
+#python -m elementfold studio
+## In Studio:
+#> /mod resonator
+#> help
+#> init δ=0.5
+#> hold
+#> tick 5
+#> step up 2
+#> status
+
+#from elementfold.experience.adapters.base import AdapterRegistry
+#run = AdapterRegistry.get("resonator")()
+#print(run(None, "init δ=0.5"))
+#print(run(None, "hold"))
+#print(run(None, "tick 6"))
+#print(run(None, "step up 1"))
+#print(run(None, "status"))
+
+#(inside studio)
+#help                 — show commands
+#status               — controller + driver snapshot
+#init δ=<value>       — reset and set δ⋆
+#hold                 — keep nearest rung
+#step up [N]          — cross upward N clicks
+#step down [N]        — cross downward N clicks
+#delta <value>        — change δ⋆ live
+#tick [N]             — run N control ticks
+#driver sim|null      — switch driver
+```
