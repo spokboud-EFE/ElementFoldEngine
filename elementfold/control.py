@@ -1,56 +1,74 @@
 # ElementFold · control.py
+# ──────────────────────────────────────────────────────────────────────────────
 # The Supervisor is a tiny feedback controller that keeps the engine “in tune.”
-# It watches telemetry (κ for phase alignment, p½ for boundary hits, ‖∇‖ for instability)
-# and gently nudges three knobs used by Fold–Gate–Norm blocks:
-#   • β (beta):    exposure — how strongly the gate amplifies structure,
-#   • γ (gamma):   damping  — how hard the normalizer calms energy,
-#   • ⛔ (clamp):  gate cap — how far negative gate values can go before we cut them off.
+# It watches telemetry and gently nudges three knobs used by Fold–Gate–Norm:
+#   • β (beta)   — exposure: how strongly the gate amplifies structure
+#   • γ (gamma)  — damping : how hard the normalizer calms energy
+#   • ⛔ (clamp) — gate cap: ceiling for negative gate excursions
+#
+# Design goals:
+#   • Simple, readable, dependency‑free (pure stdlib).
+#   • Forgiving telemetry: accepts ASCII ('kappa','p_half') and Unicode ('κ','p½').
+#   • Gentle changes with EMA smoothing + hysteresis to avoid “hunting.”
+#   • Rails aligned with RungController so blending stays sane.
+#
+# Contract:
+#   sup = Supervisor()
+#   ctrl = sup.update(telemetry)        # -> {"beta","gamma","clamp"}
+#   sup.apply(model)                    # optional: calls model.apply_control(...)
+#
+from __future__ import annotations
 
-from __future__ import annotations  # Allow forward type hints in older Python
-from typing import Dict, Optional   # Type hints for readability
-import math                        # For finite checks and simple numbers
+from typing import Dict, Optional
+import math
 
 
 class Supervisor:
     """
-    A small, stateful controller. You call .update(telemetry) each step to
-    get a new {beta, gamma, clamp} recommendation. Optionally call .apply(model)
-    to push those settings into the model’s FGN blocks (via .apply_control).
+    A small, stateful controller. Call .update(telemetry) each step to obtain a
+    {beta, gamma, clamp} recommendation. Optionally call .apply(model) to push
+    those settings into the model (expects model.apply_control(beta=?, gamma=?, clamp=?)).
 
-    Design choices:
-      • Boundaries: prevent runaway (β, γ, clamp) with simple min/max limits.
-      • Gentle steps: small increments (step≈0.05) reduce oscillation (“hunting”).
-      • EMA telemetry: exponential moving average smooths noisy signals.
-      • Hysteresis: only relax when the system is safely coherent to avoid flapping.
+    Tunables:
+      • step: smallest nudge (default 0.05)
+      • ema : exponential smoothing factor in [0,1) (closer to 1 → smoother)
+      • bounds: safety rails; chosen to match RungController’s defaults
     """
 
     def __init__(
         self,
-        beta: float = 1.0,                       # Start with moderate exposure.
-        gamma: float = 0.5,                      # Start with moderate damping.
-        clamp: float = 5.0,                      # Allow moderate gating depth.
-        beta_bounds = (0.5, 2.0),                # Keep β within physical sense.
-        gamma_bounds = (0.0, 0.9),               # Keep γ ∈ [0,1); 1.0 can over‑damp.
-        clamp_bounds = (1.0, 10.0),              # Clamp cannot be negative; 1..10 is practical.
-        step: float = 0.05,                      # Base step for nudges (small = smoother).
-        ema: float = 0.9,                        # EMA smoothing for telemetry (closer to 1 → smoother).
+        beta: float = 1.0,                       # start with moderate exposure
+        gamma: float = 0.5,                      # start with moderate damping
+        clamp: float = 5.0,                      # allow moderate gating depth
+        beta_bounds = (0.5, 3.0),                # match RungController rails
+        gamma_bounds = (0.0, 1.5),
+        clamp_bounds = (1.0, 12.0),
+        step: float = 0.05,                      # base nudge size
+        ema: float = 0.90,                       # telemetry smoothing
     ):
-        # — store control state (what we will broadcast) —
-        self.beta = float(beta)                  # β exposure
-        self.gamma = float(gamma)                # γ damping
-        self.clamp = float(clamp)                # ⛔ gate clamp
+        # Control state (what we “publish”)
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        self.clamp = float(clamp)
 
-        # — remember allowed ranges so we never drift into nonsense —
-        self.beta_bounds = (float(beta_bounds[0]), float(beta_bounds[1]))     # [β_min, β_max]
-        self.gamma_bounds = (float(gamma_bounds[0]), float(gamma_bounds[1]))  # [γ_min, γ_max]
-        self.clamp_bounds = (float(clamp_bounds[0]), float(clamp_bounds[1]))  # [c_min, c_max]
+        # Safety rails
+        self.beta_bounds = (float(beta_bounds[0]), float(beta_bounds[1]))
+        self.gamma_bounds = (float(gamma_bounds[0]), float(gamma_bounds[1]))
+        self.clamp_bounds = (float(clamp_bounds[0]), float(clamp_bounds[1]))
 
-        # — controller tuning parameters —
-        self.step = float(step)                  # Smallest adjustment unit.
-        self.ema = float(ema)                    # EMA factor for telemetry smoothing.
+        # Tuning
+        self.step = float(step)
+        self.ema = float(ema)
 
-        # — smoothed telemetry cache (initialized empty; filled on first update) —
-        self._ema: Dict[str, float] = {}         # Keys: 'kappa', 'p_half', 'grad_norm'
+        # Targets + thresholds (gentle heuristics)
+        self._kappa_expose = 0.80   # if κ < 0.80 → increase β
+        self._kappa_relax  = 0.95   # if κ > 0.95 and p½ small → relax β, loosen ⛔
+        self._p_half_safe  = 0.05   # if p½ > 0.05 → increase γ, tighten ⛔
+        self._p_half_tiny  = 0.01   # if p½ < 0.01 and κ high → relax β, loosen ⛔
+        self._grad_high    = 1.50   # optional: treat big gradients as instability
+
+        # Smoothed telemetry cache
+        self._ema: Dict[str, float] = {}  # keys: 'kappa','p_half','grad_norm'
 
     # ————————————————————————————————————————————————
     # Public API
@@ -60,65 +78,73 @@ class Supervisor:
         """
         Update internal β/γ/⛔ recommendations using current telemetry.
 
-        Telemetry keys we read (all optional; default to safe values):
-          • 'kappa'     : phase concentration in [0,1], larger is better.
-          • 'p_half'    : fraction touching half‑click boundary, smaller is better.
-          • 'grad_norm' : gradient norm, larger can signal instability.
+        Telemetry keys we accept (all optional):
+          • 'kappa' or 'κ'          — phase concentration in [0,1] (larger is better)
+          • 'p_half' or 'p½'        — proximity to half‑step barrier in [0,1] (smaller is better)
+          • 'grad_norm'             — gradient norm (larger can signal instability)
+          • Optional for fallback: 'x_mean', 'delta' or 'δ⋆'
+            (if p_half is missing, we derive it from residual vs. rung grid)
 
-        Returns a dict you can log or feed to .apply():
+        Returns:
             {'beta': β, 'gamma': γ, 'clamp': ⛔}
         """
-        # — read and smooth incoming telemetry —
-        kappa = self._ema_update("kappa", float(telemetry.get("kappa", 1.0)))         # default to “good” if absent
-        p_half = self._ema_update("p_half", float(telemetry.get("p_half", 0.0)))      # default to “safe”
-        grad = self._ema_update("grad_norm", float(telemetry.get("grad_norm", 0.0)))  # default to “calm”
+        # 0) Read tolerant telemetry (ASCII or Unicode) + derive fallbacks
+        kappa_raw, p_half_raw, grad_raw = self._read_telemetry(telemetry)
 
-        # — guard against NaNs/inf: fall back to last known good values —
-        kappa = self._finite_or(kappa, 1.0)   # if broken, pretend we are coherent
-        p_half = self._finite_or(p_half, 0.0) # if broken, pretend we are safe
-        grad = self._finite_or(grad, 0.0)     # if broken, pretend gradients are calm
+        # 1) Smooth with EMA
+        kappa = self._ema_update("kappa", kappa_raw)
+        p_half = self._ema_update("p_half", p_half_raw)
+        grad = self._ema_update("grad_norm", grad_raw)
 
-        # — control logic: gently push toward “coherent and safe” regime —
-        # 1) Adjust γ (damping): increase when boundary hits are common; relax when safely locked.
-        if p_half > 0.05:                               # too many boundary touches → more damping
+        # 2) Replace NaN/Inf with safe defaults
+        kappa = self._finite_or(kappa, 1.0)   # pretend “coherent” if broken
+        p_half = self._finite_or(p_half, 0.0) # pretend “safe” if broken
+        grad = self._finite_or(grad, 0.0)     # pretend “calm” if broken
+
+        # 3) Control logic (gentle, with hysteresis)
+        # — γ (damping): higher when near barriers, lower when safely away
+        if p_half > self._p_half_safe:
             self.gamma += self.step
-        else:                                           # otherwise, relax slightly
+        else:
             self.gamma -= 0.5 * self.step
 
-        # 2) Adjust β (exposure): increase when phases are not aligned; decrease when very coherent and safe.
-        if kappa < 0.80:                                # low alignment → expose more
-            self.beta += 2.0 * self.step               # a bit stronger push (0.10 with step=0.05)
-        elif kappa > 0.95 and p_half < 0.01:           # locked and safe → calm exposure
+        # — β (exposure): increase if not well aligned; trim if very coherent and safe
+        if kappa < self._kappa_expose:
+            self.beta += 2.0 * self.step          # slightly stronger push toward movement
+        elif kappa > self._kappa_relax and p_half < self._p_half_tiny:
             self.beta -= self.step
 
-        # 3) Adjust clamp (gate cap): tighten when unstable; loosen when very stable.
-        if p_half > 0.05 or grad > 1.5:                # unsafe edges or big gradients
-            self.clamp -= 4.0 * self.step             # shrink fast (e.g., −0.20)
-        elif kappa > 0.95 and p_half < 0.01:           # very stable
-            self.clamp += 2.0 * self.step             # expand slowly (+0.10)
+        # — ⛔ (clamp): tighten near barriers or on high gradients; loosen when very stable
+        if p_half > self._p_half_safe or grad > self._grad_high:
+            self.clamp -= 4.0 * self.step
+        elif kappa > self._kappa_relax and p_half < self._p_half_tiny:
+            self.clamp += 2.0 * self.step
 
-        # — enforce bounds so controls remain meaningful —
-        self.beta = self._clip(self.beta, *self.beta_bounds)     # clamp β into its range
-        self.gamma = self._clip(self.gamma, *self.gamma_bounds)  # clamp γ into [γ_min, γ_max]
-        self.clamp = self._clip(self.clamp, *self.clamp_bounds)  # clamp ⛔ into [c_min, c_max]
+        # 4) Enforce rails
+        self.beta = self._clip(self.beta, *self.beta_bounds)
+        self.gamma = self._clip(self.gamma, *self.gamma_bounds)
+        self.clamp = self._clip(self.clamp, *self.clamp_bounds)
 
-        # — report the current controller recommendation —
         return {"beta": self.beta, "gamma": self.gamma, "clamp": self.clamp}
 
     def apply(self, model) -> None:
         """
         Push the current controls into a model if it supports .apply_control().
-        This is a convenience so training loops can do:
-            sup.update(tele); sup.apply(model)
+        This lets training loops do:
+            ctrl = sup.update(tele); sup.apply(model)
         """
-        # Many ElementFold models implement .apply_control(beta=?, gamma=?, clamp=?).
         if hasattr(model, "apply_control"):
             model.apply_control(beta=self.beta, gamma=self.gamma, clamp=self.clamp)
 
-    def set_control(self, beta: Optional[float] = None, gamma: Optional[float] = None, clamp: Optional[float] = None) -> None:
+    def set_control(
+        self,
+        beta: Optional[float] = None,
+        gamma: Optional[float] = None,
+        clamp: Optional[float] = None,
+    ) -> None:
         """
-        Manually override any of the three knobs. Values are clipped to legal ranges.
-        Useful when a steering layer or UI wants to take over.
+        Manually override any of the three knobs (values are clipped to legal ranges).
+        Useful when a UI or a higher‑level policy wants to take over temporarily.
         """
         if beta is not None:
             self.beta = self._clip(float(beta), *self.beta_bounds)
@@ -127,6 +153,15 @@ class Supervisor:
         if clamp is not None:
             self.clamp = self._clip(float(clamp), *self.clamp_bounds)
 
+    def reset(self, beta: float = 1.0, gamma: float = 0.5, clamp: float = 5.0) -> None:
+        """
+        Reset controller state and clear EMA memory (fresh start).
+        """
+        self.beta = self._clip(float(beta), *self.beta_bounds)
+        self.gamma = self._clip(float(gamma), *self.gamma_bounds)
+        self.clamp = self._clip(float(clamp), *self.clamp_bounds)
+        self._ema.clear()
+
     def state(self) -> Dict[str, float]:
         """
         Snapshot the current controller settings (handy for logs and dashboards).
@@ -134,31 +169,67 @@ class Supervisor:
         return {"beta": self.beta, "gamma": self.gamma, "clamp": self.clamp}
 
     # ————————————————————————————————————————————————
-    # Internals (small helpers)
+    # Internals
     # ————————————————————————————————————————————————
+
+    def _read_telemetry(self, tele: Dict[str, float]) -> tuple[float, float, float]:
+        """
+        Tolerant reader for (κ, p½, grad_norm), with fallbacks:
+          • κ:  prefer 'kappa' else 'κ'; if missing and p½ present → 1−p½.
+          • p½: prefer 'p_half' else 'p½'; if missing and x_mean, δ⋆ present,
+                 estimate from residual: p½ ≈ min(1, |x − k·δ⋆| / (0.5·δ⋆)).
+          • grad_norm: optional; default 0.0.
+        """
+        # Raw pulls (accept both ASCII and Unicode keys)
+        kappa = tele.get("kappa", tele.get("κ", None))
+        p_half = tele.get("p_half", tele.get("p½", None))
+        grad = tele.get("grad_norm", 0.0)
+
+        # If p_half missing, try to derive from x_mean and δ⋆
+        if p_half is None:
+            x = tele.get("x_mean", None)
+            delta = tele.get("delta", tele.get("δ⋆", None))
+            if (x is not None) and (delta is not None):
+                try:
+                    delta = float(delta)
+                    if delta > 0.0:
+                        # nearest rung index
+                        k = int(math.floor((float(x) / delta) + 0.5))
+                        r = float(x) - k * delta
+                        p_half = min(1.0, abs(r) / (0.5 * delta))
+                except Exception:
+                    p_half = None
+
+        # If κ missing but p½ known, approximate κ ≈ 1 − p½ (coherence proxy)
+        if kappa is None and p_half is not None:
+            try:
+                kappa = 1.0 - float(p_half)
+            except Exception:
+                kappa = None
+
+        # Safe defaults
+        kappa = float(kappa) if kappa is not None else 1.0
+        p_half = float(p_half) if p_half is not None else 0.0
+        grad = float(grad) if math.isfinite(float(grad)) else 0.0
+
+        return kappa, p_half, grad
 
     def _ema_update(self, key: str, value: float) -> float:
         """
-        Exponential moving average: smooths noisy telemetry.
-        y_t = α·y_{t−1} + (1−α)·x_t
+        Exponential moving average: y_t = α·y_{t−1} + (1−α)·x_t
         """
+        v = float(value)
         if key not in self._ema:
-            self._ema[key] = float(value)                # First value initializes the EMA.
+            self._ema[key] = v
         else:
-            a = self.ema                                 # α close to 1 favors history (smoother).
-            self._ema[key] = a * self._ema[key] + (1 - a) * float(value)
+            a = self.ema
+            self._ema[key] = a * self._ema[key] + (1.0 - a) * v
         return self._ema[key]
 
     @staticmethod
     def _clip(v: float, lo: float, hi: float) -> float:
-        """
-        Keep v within [lo, hi].
-        """
         return max(lo, min(hi, v))
 
     @staticmethod
     def _finite_or(v: float, default: float) -> float:
-        """
-        Replace NaN/Inf with a safe default.
-        """
         return v if math.isfinite(v) else float(default)

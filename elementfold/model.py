@@ -1,146 +1,218 @@
 # ElementFold · model.py
-# This file defines the end‑to‑end model the engine trains and serves.
-# It has two ideas:
-#   1) RotaryClick — apply a clean, deterministic rotation per time step using the click δ⋆.
-#      This “turns” feature pairs like a tiny 2‑D rotor so depth can feel the ledger rhythm.
-#   2) A stack of Fold–Gate–Norm (FGN) blocks — each block collects → exposes → normalizes,
-#      then we keep identity through a residual lane and read out logits (for tokens) and X (ledger scalar).
+# ──────────────────────────────────────────────────────────────────────────────
+# Overview (plain words)
+# ----------------------
+# The model does three simple things end‑to‑end:
+#   1) Embed tokens into ℝᴰ, then apply a tiny, deterministic “rotor” per time
+#      step that depends on the click size δ⋆. This is the RotaryClick.
+#   2) Run a stack of Fold–Gate–Norm (FGN) blocks that:
+#        • fold information,
+#        • expose novelty via a gate (strength ≈ β),
+#        • calm energy via a normalizer (damping ≈ γ),
+#        • and keep identity through a residual path,
+#      optionally clamped by ⛔ to keep gates safe.
+#   3) Read out:
+#        • logits over tokens (language head),
+#        • a scalar ledger coordinate X per time (ledger head).
+#
+# Public contract
+# ---------------
+#   forward(x: (B,T) int64) → (logits: (B,T,V), X: (B,T))
+#   apply_control(beta=?, gamma=?, clamp=?)  # propagate (β, γ, ⛔) into all FGN blocks
+#
+# Notes
+# -----
+# • The “heads” knob is kept for config parity with attention models; FGN doesn’t
+#   use it directly but other parts of the code expect it to exist.
+# • RotaryClick uses θ⋆ = 2π·δ⋆ so ~1/δ⋆ steps make a full turn; δ⋆≈0.03 → ~32 steps.
+# • The ledger head is intentionally simple (linear) so training + regularizers
+#   (AlignHead, VariationalLedger) shape it cleanly.
 
-import torch, torch.nn as nn, math        # ✴ PyTorch tensors & modules; math for π
-from .fgn import FGNBlock                 # ⟲ Fold–Gate–Norm building block
+from __future__ import annotations
+
+import math
+import torch
+import torch.nn as nn
+
+from .fgn import FGNBlock  # Fold–Gate–Norm building block (must expose either .apply_control(...) or gate/norm params)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Rotary phase: a tiny, deterministic “turn” per time step
+# ──────────────────────────────────────────────────────────────────────────────
 class RotaryClick(nn.Module):
     """
-    RotaryClick applies a *deterministic phase rotation* across the feature dimension
-    that advances one fixed step per time index. It is controlled by the click δ⋆:
-
-        θ⋆ = 2π · δ⋆
-        angle at step t: θ_t = t · θ⋆
-
-    We split the feature dimension D into interleaved 2‑component lanes (A,B) and
-    rotate each pair by (cos θ_t, sin θ_t). If D is odd, the last feature is left unchanged.
+    Apply a phase rotation across feature lanes that advances by a fixed angle per
+    time index. For each adjacent feature pair (A,B) we rotate:
+        [A'; B'] = [ cos θ_t  −sin θ_t ] [A; B]
+                   [ sin θ_t   cos θ_t ]
+    with θ_t = t · (2π·δ⋆). Odd tails (if D is odd) are passed through unchanged.
     """
-    def __init__(self, dim, delta=0.030908106561043047):       # ✴ receive feature size and δ⋆
-        super().__init__()                                     # ✴ standard nn.Module init
-        self.dim = int(dim)                                    # ≡ keep D as a plain int
-        self.theta = 2 * math.pi * float(delta)                # θ⋆ = 2π·δ⋆ (precompute)
+    def __init__(self, dim: int, delta: float = 0.030908106561043047):
+        super().__init__()
+        self.dim   = int(dim)
+        self.theta = 2.0 * math.pi * float(delta)  # θ⋆ = 2π·δ⋆
 
-    def forward(self, x):                                      # x: (B,T,D) batch × time × features
-        b, t, d = x.shape                                      # ✴ read shapes
-        half = (d // 2) * 2                                    # ≡ largest even ≤ D (pairs need even count)
-        idx = torch.arange(half, device=x.device)              # [0..half−1] on the right device
-        i0 = idx[0::2]                                         # even lanes → A components
-        i1 = idx[1::2]                                         # odd  lanes → B components
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B,T,D) features
+        Returns:
+            (B,T,D) rotated features
+        """
+        B, T, D = x.shape
+        # If we have fewer than 2 lanes, rotation is a no‑op.
+        if D < 2:
+            return x
 
-        angles = torch.arange(t, device=x.device).float() * self.theta  # θ_t = t·θ⋆
-        c = torch.cos(angles).unsqueeze(0).unsqueeze(-1)       # cos θ → (1,T,1) for broadcast
-        s = torch.sin(angles).unsqueeze(0).unsqueeze(-1)       # sin θ → (1,T,1)
+        # Use the largest even slice for paired rotation; carry any odd tail.
+        even = (D // 2) * 2
+        i0 = torch.arange(0, even, 2, device=x.device)
+        i1 = torch.arange(1, even, 2, device=x.device)
 
-        x0 = x[:, :, i0]                                       # (B,T,D/2) → A lanes
-        x1 = x[:, :, i1]                                       # (B,T,D/2) → B lanes
-        xro0 = x0 * c - x1 * s                                 # A' =  A·cos − B·sin
-        xro1 = x0 * s + x1 * c                                 # B' =  A·sin + B·cos
+        # θ_t for t = 0..T−1 (match dtype/device to x for clean math)
+        angles = torch.arange(T, device=x.device, dtype=x.dtype) * self.theta
+        c = torch.cos(angles).view(1, T, 1)   # (1,T,1)
+        s = torch.sin(angles).view(1, T, 1)   # (1,T,1)
 
-        xr = x.new_zeros(b, t, half)                           # buffer for the rotated even part
-        xr[:, :, 0::2] = xro0                                  # interleave A'
-        xr[:, :, 1::2] = xro1                                  # interleave B'
+        A = x[:, :, i0]                       # (B,T,even/2)
+        Bp = x[:, :, i1]                      # (B,T,even/2)
 
-        if d > half:                                           # if D is odd, carry the tail unchanged
-            xr = torch.cat([xr, x[:, :, half:]], dim=-1)
+        Ar = A * c - Bp * s                   # rotate pairs in place…
+        Br = A * s + Bp * c
 
-        return xr                                              # ✴ rotated features (B,T,D)
+        out = x.new_empty(B, T, D)
+        out[:, :, 0:even:2] = Ar
+        out[:, :, 1:even:2] = Br
+        if D > even:
+            out[:, :, even:] = x[:, :, even:]  # pass odd tail unchanged
+        return out
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# The end‑to‑end ElementFold model
+# ──────────────────────────────────────────────────────────────────────────────
 class Model(nn.Module):
     """
-    ElementFold model:
-      • Token embedding → (B,T,D)
-      • RotaryClick to inject δ⋆ rhythm across time
-      • L stacked FGN blocks (each collects, gates, normalizes, preserves identity)
-      • LayerNorm for a calm output scale
-      • Two heads:
-          - lm:     D → vocab logits (language modeling / token prediction)
-          - ledger: D → scalar X per step (the learned ledger coordinate)
+    Stem → RotaryClick → [FGN]×L → LayerNorm → {lm head, ledger head}
+
+    forward(x) returns (logits, X), where:
+      • logits ∈ ℝ^{B×T×V} for token prediction,
+      • X      ∈ ℝ^{B×T}   is the ledger scalar (anchored log) per time.
     """
     def __init__(
         self,
-        vocab=256,                            # vocabulary size
-        d=128,                                # feature width D
-        layers=4,                             # number of FGN blocks
-        heads=4,                              # kept for config parity with attention models
-        seq_len=128,                          # max sequence length for helpers/CLI
-        fold='grid',                          # placeholder knob (current FGN is grid‑style)
-        delta=0.030908106561043047,           # click δ⋆ (controls rotary angle θ⋆)
+        vocab:   int   = 256,                     # vocabulary size V
+        d:       int   = 128,                     # feature width D
+        layers:  int   = 4,                       # number of FGN blocks
+        heads:   int   = 4,                       # kept for config parity (unused here)
+        seq_len: int   = 128,                     # max sequence length (for helpers/CLI)
+        fold:    str   = "grid",                  # stylistic knob for FGN families
+        delta:   float = 0.030908106561043047,    # δ⋆ click size
     ):
-        super().__init__()                    # ✴ base init
-
-        # — Hyper‑parameters (exposed as attributes for UX/tools) —
-        self.vocab = int(vocab)
-        self.d = int(d)
+        super().__init__()
+        # Expose a few attributes (other modules read these)
+        self.vocab   = int(vocab)
+        self.d       = int(d)
+        self.layers  = int(layers)
+        self.heads   = int(heads)
         self.seq_len = int(seq_len)
-        self.delta = float(delta)
+        self.fold    = str(fold)
+        self.delta   = float(delta)
 
-        # — Stem: embedding + rotary phase —
-        self.emb = nn.Embedding(self.vocab, self.d)            # ids → dense features
-        self.rot = RotaryClick(self.d, self.delta)             # deterministic δ⋆ rotation
+        # — Stem: token embedding + deterministic rotary phase —
+        self.emb = nn.Embedding(self.vocab, self.d)
+        self.rot = RotaryClick(self.d, self.delta)
 
-        # — Core: stack of Fold–Gate–Norm blocks —
-        self.blocks = nn.ModuleList([FGNBlock(self.d) for _ in range(int(layers))])
+        # — Core: a tidy stack of FGN blocks —
+        self.blocks = nn.ModuleList([FGNBlock(self.d) for _ in range(self.layers)])
 
-        # — Heads: logits + ledger —
-        self.norm = nn.LayerNorm(self.d)                       # calm output scale
-        self.lm = nn.Linear(self.d, self.vocab)                # D → V logits
-        self.ledger = nn.Linear(self.d, 1)                     # D → 1 ledger scalar
+        # — Heads: calm output scale then project to logits and ledger —
+        self.norm   = nn.LayerNorm(self.d)
+        self.lm     = nn.Linear(self.d, self.vocab)   # (B,T,D) → (B,T,V)
+        self.ledger = nn.Linear(self.d, 1)            # (B,T,D) → (B,T,1)
 
-        # last applied controls (useful for UX/telemetry)
+        # Track the last applied (β, γ, ⛔) for UX/telemetry readback
         self._last_control = {"beta": None, "gamma": None, "clamp": None}
 
-    def forward(self, x):
+        self._init_weights()
+
+    # ————————————————————————————————————————————————
+    # Forward: (B,T) → (B,T,V) & (B,T)
+    # ————————————————————————————————————————————————
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B,T) int64 token ids
-
         Returns:
-            logits: (B,T,V) token logits
-            X:      (B,T)   ledger scalar per time step
+            logits: (B,T,V)
+            X:      (B,T)
         """
-        h = self.emb(x)                                        # (B,T) → (B,T,D)
-        h = self.rot(h)                                        # inject δ⋆ rhythm
-        for b in self.blocks:                                  # refinement stack
-            h = b(h)                                           # fold → gate → norm → residual
-        h = self.norm(h)                                       # stabilize for heads
+        h = self.emb(x)          # (B,T,D)
+        h = self.rot(h)          # inject δ⋆ rhythm
+        for blk in self.blocks:  # refine through Fold–Gate–Norm stacks
+            h = blk(h)
+        h = self.norm(h)         # calm scale for stable heads
 
-        logits = self.lm(h)                                    # (B,T,D) → (B,T,V)
-        X = self.ledger(h).squeeze(-1)                         # (B,T,D) → (B,T)
+        logits = self.lm(h)                  # (B,T,V)
+        X      = self.ledger(h).squeeze(-1)  # (B,T,1) → (B,T)
         return logits, X
 
     # ————————————————————————————————————————————————
-    # External slow‑control: (β exposure, γ damping, ⛔ clamp)
+    # Slow‑control hook: propagate (β, γ, ⛔) to all FGN blocks
     # ————————————————————————————————————————————————
-    def apply_control(self, beta: float | None = None, gamma: float | None = None, clamp: float | None = None):
+    def apply_control(
+        self,
+        beta:  float | None = None,   # β — gate exposure
+        gamma: float | None = None,   # γ — normalizer damping
+        clamp: float | None = None,   # ⛔ — gate clamp cap
+    ) -> None:
         """
-        Push control into all FGN blocks. We try a block‑level `apply_control` if present,
-        otherwise fall back to setting gate/norm parameters directly. Callers can leave any
-        argument as None to keep it unchanged.
+        Tries the block‑level `.apply_control(...)` if present. Otherwise, falls back to
+        writing into known attributes:
+            • blk.gate.beta, blk.gate.clamp
+            • blk.norm.gamma  (or blk.norm.weight as a universal fallback)
         """
         self._last_control = {"beta": beta, "gamma": gamma, "clamp": clamp}
-        for b in self.blocks:
-            # Preferred path: let the block do its own bookkeeping if it exposes apply_control.
-            if hasattr(b, "apply_control"):
-                b.apply_control(beta=beta, gamma=gamma, clamp=clamp)
+
+        for blk in self.blocks:
+            # Preferred: block knows how to apply controls to its internals.
+            if hasattr(blk, "apply_control") and callable(blk.apply_control):
+                blk.apply_control(beta=beta, gamma=gamma, clamp=clamp)
                 continue
-            # Fallback: reach into submodules defensively.
-            if beta is not None and hasattr(b, "gate") and hasattr(b.gate, "beta"):
-                with torch.no_grad():
-                    b.gate.beta.copy_(torch.tensor(float(beta), device=b.gate.beta.device, dtype=b.gate.beta.dtype))
-            if clamp is not None and hasattr(b, "gate") and hasattr(b.gate, "clamp"):
-                with torch.no_grad():
-                    b.gate.clamp.copy_(torch.tensor(float(clamp), device=b.gate.clamp.device, dtype=b.gate.clamp.dtype))
-            if gamma is not None and hasattr(b, "norm") and hasattr(b.norm, "gamma"):
-                with torch.no_grad():
-                    b.norm.gamma.copy_(torch.tensor(float(gamma), device=b.norm.gamma.device, dtype=b.norm.gamma.dtype))
+
+            # Defensive fallbacks (avoid breaking if FGN internals differ slightly)
+            with torch.no_grad():
+                # Gate exposure β and clamp ⛔
+                gate = getattr(blk, "gate", None)
+                if gate is not None:
+                    if beta  is not None and hasattr(gate, "beta"):
+                        gate.beta.fill_(float(beta))
+                    if clamp is not None and hasattr(gate, "clamp"):
+                        gate.clamp.fill_(float(clamp))
+
+                # Norm damping γ (try .gamma, else fall back to LayerNorm.weight)
+                norm = getattr(blk, "norm", None)
+                if norm is not None and gamma is not None:
+                    if hasattr(norm, "gamma"):
+                        norm.gamma.fill_(float(gamma))
+                    elif hasattr(norm, "weight"):
+                        norm.weight.fill_(float(gamma))
 
     def last_control(self) -> dict:
-        """Return the latest (β, γ, ⛔) controls that were applied."""
+        """Return the most recently applied (β, γ, ⛔) values (handy for status UIs)."""
         return dict(self._last_control)
+
+    # ————————————————————————————————————————————————
+    # Initialization (small, stable scales)
+    # ————————————————————————————————————————————————
+    def _init_weights(self) -> None:
+        # Keep embeddings and blocks default‑init (PyTorch does a sensible job).
+        # Heads: small normal for logits; near‑zero ledger so training sculpts X gently.
+        nn.init.normal_(self.lm.weight, std=0.02)
+        if self.lm.bias is not None:
+            nn.init.zeros_(self.lm.bias)
+
+        nn.init.zeros_(self.ledger.weight)
+        if self.ledger.bias is not None:
+            nn.init.zeros_(self.ledger.bias)

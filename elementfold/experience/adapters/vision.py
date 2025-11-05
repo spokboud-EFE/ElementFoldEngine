@@ -17,7 +17,10 @@
 
 from __future__ import annotations
 import math
+from typing import Tuple
+
 import torch
+
 from .base import AdapterRegistry
 from ...tokenizer import SimpleTokenizer
 
@@ -36,12 +39,22 @@ def _apply_style_to_model(model, style):
     """
     params = None
     if isinstance(style, dict) and all(k in style for k in ("beta", "gamma", "clamp")):
-        params = {"beta": float(style["beta"]), "gamma": float(style["gamma"]), "clamp": float(style["clamp"])}
+        try:
+            params = {"beta": float(style["beta"]), "gamma": float(style["gamma"]), "clamp": float(style["clamp"])}
+        except Exception:
+            params = None
     elif _HAS_STEER and isinstance(style, (torch.Tensor, list, tuple)) and len(style) >= 3:
         v = torch.as_tensor(style, dtype=torch.float32)
-        params = SteeringController.to_params(v)
+        try:
+            params = SteeringController.to_params(v)
+        except Exception:
+            params = None
+
     if params and hasattr(model, "apply_control"):
-        model.apply_control(beta=params["beta"], gamma=params["gamma"], clamp=params["clamp"])
+        try:
+            model.apply_control(beta=params["beta"], gamma=params["gamma"], clamp=params["clamp"])
+        except Exception:
+            pass
     return params or {}
 
 
@@ -49,7 +62,7 @@ def _apply_style_to_model(model, style):
 _PALETTE = " ▁▂▃▄▅▆▇█"  # leading space + 7 levels
 
 
-def _row_bar(values, width=32):
+def _row_bar(values: torch.Tensor, width: int = 32) -> str:
     """
     Render a single row of coherence values (0..1) into a Unicode bar.
     We resample the row into `width` cells and pick a block level per cell.
@@ -65,10 +78,13 @@ def _row_bar(values, width=32):
     return "".join(_PALETTE[l] for l in levels.tolist())
 
 
-def _prompt_to_square_ids(prompt: str, vocab: int = 256) -> torch.Tensor:
+def _prompt_to_square_ids(prompt: str, vocab: int = 256) -> Tuple[torch.Tensor, int]:
     """
     Convert text → token ids and arrange into a near‑square grid (H×W) flattened row‑major.
     This gives a deterministic “pseudo‑image” without external I/O.
+
+    Returns:
+        (ids_flat, side) where ids_flat has shape (H*W,) and side = H = W
     """
     tok = SimpleTokenizer(vocab=vocab)
     ids = tok.encode(prompt or "")
@@ -87,18 +103,23 @@ def _run(model, prompt, style):
     1) Optionally apply steering (β, γ, ⛔) to the model.
     2) Map text → square grid of token ids.
     3) Forward through the model to get ledger field X (B,T).
-    4) Compute a per‑row coherence metric and render Unicode bars per row.
-    5) Return the multi‑line glyph.
+    4) Compute a per‑row normalized value and render Unicode bars per row.
+    5) Return the multi‑line glyph string.
     """
     _apply_style_to_model(model, style)
 
     # Build pseudo‑image tokens
-    dev = next(model.parameters()).device
+    try:
+        dev = next(model.parameters()).device
+    except Exception:
+        dev = torch.device("cpu")
+
     ids_flat, side = _prompt_to_square_ids(prompt, vocab=getattr(model, "vocab", 256))
+
     # Respect model.seq_len limit; if too small, reduce side accordingly.
-    T = int(getattr(model, "seq_len", ids_flat.numel()))
-    total = min(T, ids_flat.numel())
-    side = int(math.sqrt(total)) or 1
+    T_max = int(getattr(model, "seq_len", ids_flat.numel()))
+    total = min(T_max, ids_flat.numel())
+    side = max(1, int(math.sqrt(total)))  # keep ≥1
     total = side * side
     ids_flat = ids_flat[:total].to(dev)
     x = ids_flat.view(1, total)  # (1, H*W)
@@ -107,11 +128,10 @@ def _run(model, prompt, style):
         _logits, X = model(x)     # X: (1, H*W)
         X = X.view(1, side, side) # reshape to (1, H, W)
 
-    # Compute a simple per‑row coherence: normalize each row to [0,1] by min‑max on that row.
+    # Per‑row normalization to [0,1] using row min‑max (safe even if flat).
     rows = []
     for r in range(side):
         row = X[0, r, :]
-        # Normalize safely: if flat row, fallback to zeros.
         minv, maxv = row.min(), row.max()
         denom = (maxv - minv).abs().clamp_min(1e-9)
         norm = (row - minv) / denom
@@ -121,8 +141,8 @@ def _run(model, prompt, style):
     return header + "\n" + "\n".join(rows)
 
 
-# Register adapter: returns a zero‑arg factory that yields the runner.
-AdapterRegistry.register("vision", lambda: _runner)
-
-def _runner(model, prompt, style):
-    return _run(model, prompt, style)
+# Registry wiring: decorator form keeps registration concise and consistent.
+@AdapterRegistry.register_fn("vision")
+def make_vision_adapter():
+    # Zero‑arg factory → runner(model, prompt, style) → str
+    return _run

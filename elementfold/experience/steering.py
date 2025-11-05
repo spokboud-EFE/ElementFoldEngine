@@ -1,43 +1,72 @@
 # ElementFold · experience/steering.py
+# ──────────────────────────────────────────────────────────────────────────────
 # The SteeringController turns *intent text* into a compact control vector:
-#   v ∈ ℝ⁸ = [β, γ, clamp, style₅]
-# where:
-#   • β (beta)    — gate exposure strength (how strongly FGN exposes novelty),
-#   • γ (gamma)   — normalization damping (how hard FGN calms energy),
-#   • clamp (⛔)  — gate cap (how deep negative gate values can go before we clip),
-#   • style₅      — free style slots adapters can use (e.g., tone, tempo, sharpness, etc.).
+#   v ∈ ℝ⁸ = [β, γ, ⛔, style₅]
 #
-# The controller is deliberately small and fast:
-#   tokenizer → ids → embedding → mean‑pool → 2‑layer MLP → ℝ⁸ control.
-# We keep it trainable (see steering_train.py), but also useful “as is.”
+# Meanings:
+#   • β (beta)    — gate exposure (how strongly FGN exposes novelty),
+#   • γ (gamma)   — normalization damping (how hard FGN calms energy),
+#   • ⛔ (clamp)  — gate cap (how deep negative gate values can go before clipping),
+#   • style₅      — five free “style” scalars adapters can interpret (tone, tempo, etc.).
+#
+# Design goals:
+#   • Minimal & fast: tokenizer → ids → embedding → mean‑pool → 2‑layer MLP → ℝ⁸.
+#   • Trainable: see steering_train.py; defaults work out‑of‑the‑box.
+#   • Safe ranges: a helper maps raw outputs into Supervisor‑aligned bounds.
+#
+# Contract with Studio:
+#   ctrl = SteeringController.load_default(cfg.delta)
+#   v    = ctrl("gentle, coherent")     # → ℝ⁸
+#   p    = SteeringController.to_params(v)  # → {'beta','gamma','clamp','style'}
+#
+from __future__ import annotations
 
-import torch, torch.nn as nn                              # ✴ tensors • modules
-from ..tokenizer import SimpleTokenizer                   # ✴ tiny tokenizer (vocab≈256)
+from typing import Dict
+import torch
+import torch.nn as nn
+
+from ..tokenizer import SimpleTokenizer
 
 
-class SteeringController(nn.Module):                      # 🎚 intent → (β, γ, ⛔, style₅)
+# ──────────────────────────────────────────────────────────────────────────────
+# Small helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _sigmoid_range(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    """
+    Map ℝ → (lo, hi) smoothly via σ. Works element‑wise and is differentiable.
+    """
+    return torch.sigmoid(x) * (hi - lo) + lo
+
+
+class SteeringController(nn.Module):  # 🎚 intent → (β, γ, ⛔, style₅)
+    """
+    A tiny intent→control head. Forward returns a raw ℝ⁸ vector; use .to_params()
+    to map into meaningful ranges.
+
+    Notes:
+      • δ⋆ (delta) is cached for convenience—some adapters may want to read it.
+      • Tokenizer is intentionally tiny (vocab≈256); mean‑pooling is robust for short prompts.
+    """
+
+    # For very long prompts, we can cap length to keep latency predictable.
+    MAX_TOKENS: int = 512
+
     def __init__(self, delta: float = 0.030908106561043047):
-        """
-        Args:
-            delta: δ⋆ coherence unit (cached here so downstream consumers can read it if needed).
-        """
-        super().__init__()                                # ✴ standard Module init
-        self.delta = float(delta)                         # δ⋆ cached as a plain float
+        super().__init__()
+        self.delta = float(delta)               # δ⋆ cached (read‑only convenience)
 
         # — Embedding —
-        # We keep a tiny vocabulary (256) in sync with SimpleTokenizer; each token maps to ℝ⁶⁴.
-        self.emb = nn.Embedding(256, 64)                  # E: vocab256 → ℝ⁶⁴
+        # Keep in sync with SimpleTokenizer (vocab size = 256). Each token → ℝ⁶⁴.
+        self.emb = nn.Embedding(256, 64)
 
         # — Head (MLP) —
-        # A small 2‑layer perceptron to turn the pooled embedding into ℝ⁸ (β, γ, ⛔, style₅).
-        self.fc = nn.Sequential(                          # Π: ℝ⁶⁴ → ℝ⁸
-            nn.Linear(64, 64),                            # affine → ℝ⁶⁴
-            nn.ReLU(),                                    # nonlinearity (stable, simple)
-            nn.Linear(64, 8),                             # affine → ℝ⁸
+        # A tiny two‑layer perceptron: ℝ⁶⁴ → ℝ⁸ = [β̂, γ̂, ⛔̂, style₅].
+        self.fc = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 8),
         )
-
-        # We do not fix output ranges here; instead we offer a helper (to_params)
-        # that maps raw outputs into meaningful ranges (β∈[0.5,2.0], γ∈[0,0.9], ⛔∈[1,10]).
 
     # ————————————————————————————————————————————————
     # Core forward (kept trainable for fine‑tuning)
@@ -47,50 +76,59 @@ class SteeringController(nn.Module):                      # 🎚 intent → (β,
         Turn a text prompt into a raw control vector v ∈ ℝ⁸.
 
         Steps:
-          1) tokenize the prompt (list[int]),
-          2) embed tokens (1,L,64),
-          3) mean‑pool across L → (1,64),
-          4) MLP → (1,8),
+          1) tokenize prompt → ids,
+          2) embed → (1, L, 64),
+          3) mean‑pool across tokens → (1, 64),
+          4) MLP → (1, 8),
           5) squeeze batch → (8,).
 
         Returns:
-            torch.Tensor of shape (8,), dtype matches module parameters (float32 by default).
+            torch.Tensor shape (8,), dtype float32 by default.
         """
-        tok = SimpleTokenizer()                           # ✴ instantiate tokenizer
-        ids = tok.encode(s)                               # ids: list[int], may be empty for empty input
-        if len(ids) == 0:                                 # guard: ensure at least one token
-            ids = [0]                                     # use a neutral token id 0
+        tok = SimpleTokenizer()
+        ids = tok.encode(s)
 
-        # Build a tensor on the same device as our parameters to avoid device mismatches.
-        dev = self.emb.weight.device                      # 🖥 where the module lives (cpu/cuda)
-        x = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)  # (1,L) batchify ids
+        # Guard: allow empty input, cap extremely long inputs to bound latency.
+        if not ids:
+            ids = [0]
+        if len(ids) > self.MAX_TOKENS:
+            ids = ids[: self.MAX_TOKENS]
 
-        e = self.emb(x).mean(dim=1)                       # ⟲ pooled embedding (1,64) via mean over sequence length
-        v = self.fc(e).squeeze(0)                         # ℝ⁸ = [β̂, γ̂, ⛔̂, style₅] (raw, unconstrained)
-        return v                                          # ✴ raw controls (let caller map to ranges)
+        dev = self.emb.weight.device
+        x = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)  # (1, L)
+        e = self.emb(x).mean(dim=1)                                       # (1, 64)
+        v = self.fc(e).squeeze(0)                                         # (8,)
+        return v
 
     # ————————————————————————————————————————————————
     # Helpers: map raw vector → meaningful ranges
     # ————————————————————————————————————————————————
     @staticmethod
-    def to_params(v: torch.Tensor) -> dict:
+    def to_params(v: torch.Tensor) -> Dict[str, object]:
         """
         Convert a raw ℝ⁸ vector (as returned by forward) into interpretable parameters
         with ranges aligned to the Supervisor’s defaults:
 
-            β   ∈ [0.5, 2.0]
-            γ   ∈ [0.0, 0.9]
-            ⛔  ∈ [1.0, 10.0]
-            style ∈ ℝ⁵  (left unconstrained; adapters interpret it)
+            β    ∈ [0.5, 2.0]
+            γ    ∈ [0.0, 0.9]
+            ⛔   ∈ [1.0, 10.0]
+            style ∈ ℝ⁵  (left unconstrained; adapters can interpret freely)
 
         Returns:
             {'beta': float, 'gamma': float, 'clamp': float, 'style': torch.Tensor(5,)}
         """
-        v = v.to(torch.float32)                           # ensure stable float math
-        beta  = (v[0].sigmoid().item() + 0.5)            # map (−∞,∞) → (0,1) → (0.5,1.5) then +0.5 → (0.5,2.0)
-        gamma = (v[1].sigmoid().item() * 0.9)            # (0,1) scaled into [0,0.9]
-        clamp = (v[2].sigmoid().item() * 9.0 + 1.0)      # (0,1) → [1,10]
-        style = v[3:8].detach()                           # pass style₅ as a small free vector for adapters
+        # Ensure predictable dtype/device; drop grad to avoid leaking graphs into the UI.
+        with torch.no_grad():
+            v = v.to(dtype=torch.float32)
+
+            # Map first three controls into safe physical ranges via σ.
+            beta  = _sigmoid_range(v[0], 0.5, 2.0).item()
+            gamma = _sigmoid_range(v[1], 0.0, 0.9).item()
+            clamp = _sigmoid_range(v[2], 1.0, 10.0).item()
+
+            # Style left unconstrained for adapters (they may tanh/normalize if desired).
+            style = v[3:8].detach()
+
         return {"beta": beta, "gamma": gamma, "clamp": clamp, "style": style}
 
     # ————————————————————————————————————————————————
@@ -99,41 +137,38 @@ class SteeringController(nn.Module):                      # 🎚 intent → (β,
     @classmethod
     def load_default(cls, delta: float = 0.030908106561043047) -> "SteeringController":
         """
-        Factory: create a fresh, untrained controller.
-        This is useful for prototyping; training lives in steering_train.py.
+        Create a fresh, untrained controller (useful for prototyping).
+        Training lives in steering_train.py.
         """
-        return cls(delta)                                  # ≡ fresh controller (random weights)
+        return cls(delta)
 
     @classmethod
     def load(cls, path: str, delta: float = 0.030908106561043047) -> "SteeringController":
         """
-        Factory: load weights from a state_dict checkpoint at `path`.
-        The controller is returned in eval mode.
+        Load weights from a state_dict checkpoint at `path`. Returns the controller in eval mode.
         """
-        m = cls(delta)                                     # ✴ construct
-        sd = torch.load(path, map_location="cpu")          # 🧱 read state dict (portable)
-        m.load_state_dict(sd)                              # ⟲ load weights
-        m.eval()                                           # ≡ evaluation mode (safer defaults)
-        return m                                           # ✴ ready controller
+        m = cls(delta)
+        sd = torch.load(path, map_location="cpu")
+        m.load_state_dict(sd)
+        m.eval()
+        return m
 
     # ————————————————————————————————————————————————
     # Optional: apply controls to a model directly
     # ————————————————————————————————————————————————
-    def apply_to_model(self, model, s: str | None = None, v: torch.Tensor | None = None) -> dict:
+    def apply_to_model(self, model, s: str | None = None, v: torch.Tensor | None = None) -> Dict[str, object]:
         """
-        Convenience: produce controls (from a prompt `s` or raw vector `v`) and push them
+        Produce controls (from a prompt `s` or raw vector `v`) and push them
         into any model that implements `.apply_control(beta=?, gamma=?, clamp=?)`.
-        Returns the parameter dict actually applied.
 
-        Usage:
-            ctrl = SteeringController.load_default()
-            applied = ctrl.apply_to_model(model, s="calm, softer, lower gain")
+        Returns:
+            The parameter dict actually applied (useful for logging/UX).
         """
         if v is None:
             if s is None:
                 raise ValueError("either `s` (prompt) or `v` (raw ℝ⁸ vector) must be provided")
-            v = self.forward(s)                             # ↦ raw ℝ⁸ from text
-        params = self.to_params(v)                          # ↦ map into meaningful ranges
-        if hasattr(model, "apply_control"):                 # only apply if the model supports it
+            v = self.forward(s)
+        params = self.to_params(v)
+        if hasattr(model, "apply_control"):
             model.apply_control(beta=params["beta"], gamma=params["gamma"], clamp=params["clamp"])
-        return params                                       # useful for logging/UX
+        return params

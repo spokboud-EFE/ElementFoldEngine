@@ -1,183 +1,237 @@
 # ElementFold · variational.py
-# This file defines the convex “tension” that keeps the ledger equally spaced.
-# It penalizes two kinds of misalignment:
-#   1) seats inside a block drifting away from δ⋆/C spacing,
-#   2) consecutive blocks drifting away from δ⋆ offset.
-# Optionally, a small total‑variation (TV) term discourages jitter.
+# ──────────────────────────────────────────────────────────────────────────────
+# Intuition (plain words)
+# -----------------------
+# The ledger wants to be “evenly toothed”:
+#   • inside each block (one click), seats should be spaced by Δ_b = δ⋆ / C_b,
+#   • across blocks, the first seat should advance by exactly δ⋆,
+#   • (optionally) avoid jitter with a small TV penalty along seats.
+#
+# Subtleties we handle explicitly:
+#   • The last seat wraps back to the first seat across the click boundary.
+#     The correct target difference for that wrap edge is (δ⋆/C_b − δ⋆),
+#     not δ⋆/C_b. This matters a lot for coherence.
+#   • Gauge: there is a global translation ambiguity X → X + const.
+#     We “pin” a **single global** reference (X[0,0]) so inter‑block spacing
+#     constraints stay meaningful (we do NOT pin each row independently).
 
-import torch, torch.nn as nn  # We use PyTorch tensors and nn.Module to plug into the engine cleanly.
+from __future__ import annotations
+import torch
+import torch.nn as nn
 
 
-class VariationalLedger(nn.Module):  # A Module so it can move to GPU, save, and compose with other parts.
+class VariationalLedger(nn.Module):
+    """
+    Convex tension on the ledger:
+      E = w_seat · Σ_b,t   (X_{b,t+1} − X_{b,t} − target_b,t)^2
+        + w_block · Σ_b    (X_{b+1,0} − X_{b,0} − δ⋆)^2
+        + w_tv · Σ_b,t     |X_{b,t+1} − X_{b,t}|   (masked to valid seats)
+
+    Public API (used by train.py):
+        var = VariationalLedger(delta, capacities, tv_weight).to(device)
+        e   = var.energy(X[:, :maxcap])
+    """
+
     def __init__(
         self,
-        delta,                       # δ⋆: the fundamental “click” size.
-        capacities,                  # C per block: how many seats live inside one click in that block.
-        tv_weight=0.0,               # Weight on the total‑variation penalty along seats.
-        seat_weight=1.0,             # Weight for the seat‑spacing penalty (default 1).
-        block_weight=1.0,            # Weight for the block‑spacing penalty (default 1).
-        gauge="pin",                 # How to remove the global shift ambiguity (“gauge”): 'pin' or 'none'.
+        delta,                       # δ⋆: fundamental click size.
+        capacities,                  # per‑block seat capacities C_b (scalar, list/1D tensor, or broadcastable).
+        tv_weight: float = 0.0,      # weight for total‑variation regularizer along seats.
+        seat_weight: float = 1.0,    # weight for seat‑spacing penalty.
+        block_weight: float = 1.0,   # weight for block‑spacing penalty.
+        gauge: str = "pin",          # 'pin' = subtract X[0,0] globally; 'none' = no gauge fix.
     ):
-        super().__init__()           # Standard nn.Module initialization.
-        self.delta = float(delta)    # Store δ⋆ as a plain float for speed and clarity.
-        self.capacities = capacities # Keep raw user input; we’ll normalize it later per batch.
-        self.tv_weight = float(tv_weight)      # Cast weights to float for stable arithmetic.
-        self.seat_weight = float(seat_weight)  # Seat penalty scale.
-        self.block_weight = float(block_weight)# Block penalty scale.
-        self.gauge = str(gauge)                # Gauge mode as string.
+        super().__init__()
+        self.delta = float(delta)
+        self.capacities = capacities
+        self.tv_weight = float(tv_weight)
+        self.seat_weight = float(seat_weight)
+        self.block_weight = float(block_weight)
+        self.gauge = str(gauge)
 
     # ————————————————————————————————————————————————
-    # Public API expected by the rest of the engine
+    # Public API
     # ————————————————————————————————————————————————
 
-    def forward(self, X):            # Calling the module returns the scalar energy.
-        return self.energy(X)        # We defer to the explicit 'energy' method for readability.
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        return self.energy(X)
 
-    def energy(self, X):             # Full scalar energy = seat_term + block_term + tv_term (with weights).
-        X = self._as_2d(X)           # Ensure X has shape (B,T): B blocks (rows), T seats (cols).
-        X = self._gauge_fix(X)       # Remove the irrelevant global shift if requested (stabilizes optimization).
+    def energy(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Full scalar energy = seat_term + block_term + tv_term (with weights).
+        """
+        X = self._as_2d(X)
+        X = self._gauge_fix(X)
 
-        caps = self._expand_caps(X)  # Produce a length‑B tensor of capacities, each clamped to [1, T].
-        parts = self.energy_parts(X, caps)                # Compute individual components as a dict.
-        # Combine pieces with their weights into one scalar; '.sum()' ensures a 0‑D tensor even if any piece is empty.
+        caps = self._expand_caps(X)               # (B,) capacities clamped to [1, T]
+        parts = self.energy_parts(X, caps)        # compute individual components
         total = (
-            self.seat_weight * parts["seat_term"]
-            + self.block_weight * parts["block_term"]
-            + self.tv_weight * parts["tv_term"]
+            self.seat_weight  * parts["seat_term"] +
+            self.block_weight * parts["block_term"] +
+            self.tv_weight    * parts["tv_term"]
         )
-        return total  # A single scalar tensor (0‑D) that autograd can differentiate.
+        return total  # 0‑D tensor
 
-    # ————————————————————————————————————————————————
-    # Detailed components and diagnostics
-    # ————————————————————————————————————————————————
+    def energy_parts(self, X: torch.Tensor, caps: torch.Tensor | None = None) -> dict:
+        """
+        Return a dict with the unweighted components {seat_term, block_term, tv_term}.
+        """
+        X = self._as_2d(X)
+        X = self._gauge_fix(X)
+        caps = self._expand_caps(X) if caps is None else caps
 
-    def energy_parts(self, X, caps=None):   # Return a dict with each penalty so callers can inspect them.
-        X = self._as_2d(X)                  # Make sure X is (B,T).
-        X = self._gauge_fix(X)              # Apply gauge pin if enabled.
-        caps = self._expand_caps(X) if caps is None else caps  # Ensure capacities are present and valid.
+        dif_seat, seat_mask = self._seat_residuals_with_wrap(X, caps)   # (B,T) each
+        seat_term = (dif_seat.pow(2) * seat_mask).sum()
 
-        dif_seat, seat_mask = self.seat_residuals(X, caps)     # Seat residuals: (X_{t+1} − X_t − δ⋆/C_b).
-        seat_term = (dif_seat.pow(2) * seat_mask).sum()        # Sum of squares over valid seats only.
+        dif_block = self._block_residuals(X)                             # (B−1,)
+        block_term = dif_block.pow(2).sum()
 
-        dif_block = self.block_residuals(X)                    # Block residuals: (X_{b+1,0} − X_{b,0} − δ⋆).
-        block_term = dif_block.pow(2).sum()                    # Sum of squares across consecutive blocks.
-
-        if self.tv_weight > 0.0:                               # If TV is active, compute it; otherwise return zero.
-            tv_core = (X[:, 1:] - X[:, :-1]).abs()             # Absolute first difference along seats.
-            # TV should only act on seats that exist in that block; build a mask for columns 1..T−1.
-            T = X.size(1)                                      # Number of seat columns.
-            idx = torch.arange(T - 1, device=X.device).unsqueeze(0)           # Column indices for TV pairs.
-            tv_mask = (idx < (caps.unsqueeze(1) - 1)).to(X.dtype)             # Mask valid seat differences.
-            tv_term = (tv_core * tv_mask).sum()                # Sum absolute differences over valid seats.
+        if self.tv_weight > 0.0:
+            tv_core = (X[:, 1:] - X[:, :-1]).abs()
+            T = X.size(1)
+            idx = torch.arange(T - 1, device=X.device).unsqueeze(0)     # (1, T−1)
+            tv_mask = (idx < (caps.unsqueeze(1) - 1)).to(X.dtype)       # valid along seats 0..C_b−2
+            tv_term = (tv_core * tv_mask).sum()
         else:
-            tv_term = X.new_zeros(())                          # Scalar zero (same device/dtype as X).
+            tv_term = X.new_zeros(())
 
-        return {"seat_term": seat_term, "block_term": block_term, "tv_term": tv_term}  # Dictionary of parts.
+        return {"seat_term": seat_term, "block_term": block_term, "tv_term": tv_term}
 
-    def diagnostics(self, X):                                   # Provide normalized, human‑interpretable diagnostics.
-        X = self._as_2d(X)                                      # Ensure shape (B,T).
-        caps = self._expand_caps(X)                             # One capacity per block.
-        parts = self.energy_parts(X, caps)                      # Compute raw components.
+    def diagnostics(self, X: torch.Tensor) -> dict:
+        """
+        Human‑readable, normalized diagnostics (means per enforced relation).
+        """
+        X = self._as_2d(X)
+        X = self._gauge_fix(X)
+        caps = self._expand_caps(X)
+        parts = self.energy_parts(X, caps)
 
-        # Count how many seat relations we actually enforced: for each block, there are C_b seat edges in the cycle.
-        seat_edges = caps.to(X.dtype).sum().clamp_min(1)        # Avoid division by zero just in case.
-        # For blocks, there are B−1 relations (between consecutive blocks); clamp at 1 to avoid div by zero when B==1.
+        seat_edges = caps.to(X.dtype).sum().clamp_min(1)   # for each block: (C_b − 1) + 1wrap = C_b constraints
         block_edges = max(int(X.size(0)) - 1, 0) or 1
 
-        # Normalize terms to a per‑edge mean so they are comparable across shapes and capacities.
-        seat_mse = (parts["seat_term"] / seat_edges).item()     # Average squared seat error per seat relation.
-        block_mse = (parts["block_term"] / block_edges).item()  # Average squared block error per block relation.
-        tv_mean = (parts["tv_term"] / seat_edges).item() if self.tv_weight > 0.0 else 0.0  # Mean TV per seat.
+        seat_mse  = (parts["seat_term"]  / seat_edges).item()
+        block_mse = (parts["block_term"] / block_edges).item()
+        tv_mean   = (parts["tv_term"]    / seat_edges).item() if self.tv_weight > 0.0 else 0.0
 
         return {
-            "seat_mse": seat_mse,                 # How far seats deviate from perfect δ⋆/C spacing on average.
-            "block_mse": block_mse,               # How far blocks deviate from perfect δ⋆ jumps on average.
-            "tv_mean": tv_mean,                   # Average absolute seat difference (if enabled).
-            "B": int(X.size(0)),                  # Number of blocks.
-            "T": int(X.size(1)),                  # Number of seats per block (max columns provided).
-            "caps": caps.detach().cpu().tolist(), # The capacities used per block, for transparency.
+            "seat_mse":  seat_mse,
+            "block_mse": block_mse,
+            "tv_mean":   tv_mean,
+            "B":         int(X.size(0)),
+            "T":         int(X.size(1)),
+            "caps":      self._expand_caps(X).detach().cpu().tolist(),
         }
 
     # ————————————————————————————————————————————————
-    # Residual builders (these express the exact equal‑spacing equations)
+    # Residual builders (exact equal‑spacing equations)
     # ————————————————————————————————————————————————
 
-    def seat_residuals(self, X, caps=None):        # For each block b and seat t: r_b,t = X_{b,t+1} − X_{b,t} − δ⋆/C_b.
-        X = self._as_2d(X)                         # Ensure 2D shape.
-        caps = self._expand_caps(X) if caps is None else caps  # One capacity per block.
-        B, T = X.shape                              # Dimensions for convenience.
-        step = (self.delta / caps.to(X.dtype)).unsqueeze(1)     # Per‑block target step Δ_b = δ⋆/C_b, broadcast along seats.
+    def _seat_residuals_with_wrap(self, X: torch.Tensor, caps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        For each block b and seat t we form residuals:
 
-        # Build a mask indicating which seat columns are valid per block: columns 0..C_b−1 are valid.
-        idx = torch.arange(T, device=X.device).unsqueeze(0)     # Column index grid (1×T).
-        seat_mask = (idx < caps.unsqueeze(1)).to(X.dtype)       # Mask 1.0 where seat exists, 0.0 otherwise.
+            r_b,t = X_{b,t+1} − X_{b,t} − Δ_b      for t = 0..C_b−2     (internal edges)
+            r_b,C_b−1 = X_{b,0} − X_{b,C_b−1} − (Δ_b − δ⋆)             (wrap edge)
 
-        # For the cyclic seat equalities, we “roll” by −1 so col t+1 aligns with col t, then subtract the target step.
-        dif = X.roll(shifts=-1, dims=1) - X - step              # Residuals of equal‑spacing constraints.
+        Everything outside 0..C_b−1 is masked out.
+        Returns:
+            dif   : (B,T) residuals (zeros where masked)
+            mask  : (B,T) 1.0 for valid columns t< C_b, else 0.0
+        """
+        B, T = X.shape
+        dev, dt = X.device, X.dtype
 
-        return dif, seat_mask                                    # Caller multiplies by mask before summing.
+        # Per‑block seat step Δ_b
+        step = (self.delta / caps.to(dt)).unsqueeze(1)         # (B,1)
 
-    def block_residuals(self, X):                      # For consecutive blocks: r_b = X_{b+1,0} − X_{b,0} − δ⋆.
-        X = self._as_2d(X)                             # Ensure 2D shape.
-        if X.size(0) <= 1:                             # If only one block, there is no block relation to enforce.
-            return X.new_zeros((0,))                   # Return an empty vector (shapes nicely in sums).
-        b0 = X[:, 0]                                   # First seat from each block, shape (B,).
-        return (b0[1:] - b0[:-1]) - self.delta         # Differences between neighbors minus δ⋆.
+        # Start with all‑zeros residual grid
+        dif = X.new_zeros(B, T)
+
+        # Internal seat differences (t = 0..T−2); we will mask to t < C_b − 1
+        dnext = X[:, 1:] - X[:, :-1] - step                    # (B, T−1)
+        dif[:, :-1] = dnext
+
+        # Wrap residual at column (C_b − 1) for each block: X_{b,0} − X_{b,C_b−1} − (Δ_b − δ⋆)
+        last_idx = (caps - 1).clamp(min=0)                     # (B,)
+        rows = torch.arange(B, device=dev)
+        x0   = X[:, :1]                                        # (B,1)
+        xL   = X.gather(1, last_idx.view(-1, 1))               # (B,1)
+        wrap = x0 - xL - (step - self.delta)                   # (B,1)
+        dif[rows, last_idx] = wrap.squeeze(1)                  # place at column C_b−1 per row
+
+        # Seat mask: valid columns 0..C_b−1
+        idx = torch.arange(T, device=dev).unsqueeze(0)         # (1, T)
+        mask = (idx < caps.unsqueeze(1)).to(dt)                # (B, T)
+
+        return dif, mask
+
+    def _block_residuals(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Consecutive block spacing:
+            r_b = X_{b+1,0} − X_{b,0} − δ⋆   for b = 0..B−2
+        """
+        X = self._as_2d(X)
+        if X.size(0) <= 1:
+            return X.new_zeros((0,))
+        b0 = X[:, 0]
+        return (b0[1:] - b0[:-1]) - self.delta
 
     # ————————————————————————————————————————————————
-    # Construct an “ideal” ledger (useful for warm‑starts or assertions)
+    # Ideal layout (useful for warm‑starts or assertions)
     # ————————————————————————————————————————————————
 
-    def ideal_layout(self, B, T, caps=None, start=0.0):   # Build X where all residuals are exactly zero (up to gauge).
-        # Create an empty (B,T) tensor to fill with ideal positions.
-        dev = torch.device("cpu")                         # Default device; caller can .to(device) after if needed.
-        X = torch.empty(B, T, dtype=torch.float32, device=dev)  # Allocate the ledger grid.
+    def ideal_layout(self, B: int, T: int, caps: torch.Tensor | list | None = None, start: float = 0.0) -> torch.Tensor:
+        """
+        Construct X where all residuals are zero (up to the chosen gauge):
+            X_{b,t} = (start + b·δ⋆) + t·(δ⋆/C_b)   for t = 0..C_b−1   (then hold last value for columns ≥ C_b)
+        """
+        dev = torch.device("cpu")
+        X = torch.empty(B, T, dtype=torch.float32, device=dev)
 
-        # Expand capacities to length‑B and clamp to [1, T] so we never step outside columns.
         caps = torch.as_tensor(caps if caps is not None else self.capacities, dtype=torch.long, device=dev)
-        if caps.numel() < B:                              # If fewer than B capacities were provided, repeat the last one.
-            last = caps[-1].item()
-            caps = torch.cat([caps, caps.new_full((B - caps.numel(),), last)], dim=0)
-        caps = caps.clamp(min=1, max=T)                   # Make sure every capacity is valid.
+        if caps.numel() < B:
+            caps = torch.cat([caps, caps.new_full((B - caps.numel(),), caps[-1].item())], dim=0)
+        caps = caps.clamp(min=1, max=T)
 
-        # For each block b, fill T columns so that:
-        #   (i) seats 0..C_b−1 are spaced by δ⋆/C_b inside the block,
-        #  (ii) block b starts at 'start + b·δ⋆' (so inter‑block relation is exactly δ⋆).
-        for b in range(B):                                 # Loop over blocks for clarity (B is small in practice).
-            Cb = max(1, int(caps[b].item()))              # Capacity of this block as a plain int.
-            step = self.delta / Cb                         # Seat spacing inside this block.
-            base = start + b * self.delta                  # Starting position for block b so that blocks are δ⋆ apart.
-            # Fill the first Cb seats with exact arithmetic progression; leave remaining seats (if any) as copies of last.
-            for t in range(T):                             # Loop over seats in this row.
-                X[b, t] = base + step * min(t, Cb - 1)    # After the last valid seat, we keep the edge value (harmless for masking).
-        # Apply gauge fix to align with the rest of this class if needed.
+        for b in range(B):
+            Cb = int(caps[b].item())
+            step = self.delta / max(1, Cb)
+            base = start + b * self.delta
+            for t in range(T):
+                X[b, t] = base + step * min(t, Cb - 1)
+
         return self._gauge_fix(X) if self.gauge == "pin" else X
 
     # ————————————————————————————————————————————————
-    # Internal helpers
+    # Internals
     # ————————————————————————————————————————————————
 
-    def _as_2d(self, X):                        # Accept a 1D vector for convenience and promote to (1,T).
+    def _as_2d(self, X: torch.Tensor) -> torch.Tensor:
         return X.unsqueeze(0) if X.dim() == 1 else X
 
-    def _gauge_fix(self, X):                    # Remove the global translation ambiguity to stabilize optimization.
-        if self.gauge == "pin":                 # “Pin” the first seat of each block to zero by subtracting it.
-            return X - X[:, :1]                 # This keeps differences intact but avoids drifting means.
-        return X                                # If gauge is 'none', leave X as is.
+    def _gauge_fix(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Global pin: subtract X[0,0] (a single scalar) from all entries.
+        Preserves inter‑block differences and makes block terms meaningful.
+        """
+        if self.gauge == "pin" and X.numel() > 0:
+            return X - X[:1, :1]   # broadcasts (1,1) → (B,T)
+        return X
 
-    def _expand_caps(self, X):                  # Normalize the capacities input into a tensor of length B on X's device/dtype.
-        B, T = X.shape                          # Read batch dimensions.
-        dev, dt = X.device, X.dtype             # Cache device and dtype for new tensors.
-        caps_raw = self.capacities              # Whatever the user passed at construction time.
+    def _expand_caps(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize the constructor's `capacities` into a length‑B integer tensor
+        on X’s device, clamped to [1, T].
+        """
+        B, T = X.shape
+        dev = X.device
+        caps = torch.as_tensor(self.capacities, device=dev)
 
-        caps = torch.as_tensor(caps_raw, device=dev)      # Convert to a tensor on the same device.
-        if caps.numel() == 1:                               # If a single capacity was provided, share it across blocks.
+        if caps.numel() == 1:
             caps = caps.expand(B)
-        elif caps.numel() < B:                              # If fewer than B capacities, repeat the last for the rest.
-            last = caps[-1].item()
-            caps = torch.cat([caps, caps.new_full((B - caps.numel(),), last)], dim=0)
-        elif caps.numel() > B:                              # If more than B provided, truncate to B.
+        elif caps.numel() < B:
+            caps = torch.cat([caps, caps.new_full((B - caps.numel(),), caps[-1].item())], dim=0)
+        elif caps.numel() > B:
             caps = caps[:B]
 
-        caps = caps.clamp(min=1, max=T).to(torch.long)      # Ensure each capacity is within [1, T] and integer.
-        return caps                                         # Return per‑block capacities ready for masking/steps.
+        return caps.clamp(min=1, max=T).to(torch.long)

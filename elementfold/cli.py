@@ -1,17 +1,17 @@
 # ElementFold · cli.py
 # A narrated, gentle CLI for non‑experts:
-# - train: run the main training loop (with progress & saving)
-# - infer: quick decode (from ckpt or train‑then‑infer)
-# - studio: open the terminal steering studio
-# - doctor: print environment sanity checks (CUDA/CPU/etc.)
-# - steering-train: train the tiny SteeringController on synthetic pairs
+#   • train           — run the main training loop (with progress & optional saving)
+#   • infer           — quick decode (from checkpoint or a short train‑then‑infer)
+#   • studio          — open the terminal steering Studio
+#   • doctor          — print environment sanity checks (CUDA/CPU/MPS)
+#   • steering-train  — train the tiny SteeringController on synthetic pairs
 #
 # Examples:
-#   Train on CPU with progress and save:
+#   Train on CPU with progress and save a checkpoint:
 #     python -m elementfold train --device cpu --steps 200 --print-every 50 --out runs/test1
 #   Infer from a checkpoint via the language adapter:
 #     python -m elementfold infer --ckpt runs/test1/checkpoint.pt --prompt "hello"
-#   Read defaults from a TOML config (flags still override):
+#   Read defaults from a TOML/JSON config (flags still override):
 #     python -m elementfold train --config configs/small.toml --steps 500 --out runs/small
 #   Print environment diagnostics:
 #     python -m elementfold doctor
@@ -31,25 +31,32 @@ from .config import Config
 from .runtime import Engine
 from .tokenizer import SimpleTokenizer
 
-# Optional niceties (pretty tables/progress). Purely optional: we degrade to plain prints when missing.
+# Optional niceties (pretty tables). We degrade to plain prints when missing.
 try:
-    from rich import print as rprint  # noqa
-    from rich.table import Table  # noqa
+    from rich import print as rprint  # type: ignore
+    from rich.table import Table      # type: ignore
     _HAS_RICH = True
 except Exception:
     _HAS_RICH = False
 
 
-# --------------------------- Helpers ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _parse_caps(s: str | None) -> Tuple[int, ...]:
-    """Parse capacities like '2,6,10,14' → (2,6,10,14)."""
+    """Parse capacities like '2,6,10,14' → (2, 6, 10, 14)."""
     if not s:
         return (2, 6, 10, 14)
     try:
-        return tuple(int(x.strip()) for x in s.split(",") if x.strip())
+        vals = tuple(int(x.strip()) for x in s.split(",") if x.strip())
+        if not vals:
+            raise ValueError
+        return vals
     except Exception as e:
-        raise argparse.ArgumentTypeError("capacities must be a comma‑separated list of integers") from e
+        raise argparse.ArgumentTypeError(
+            "capacities must be a comma‑separated list of integers (e.g. '2,6,10,14')"
+        ) from e
 
 
 def _coerce_device(choice: str | None) -> str | None:
@@ -80,6 +87,7 @@ def _cfg_with_extras(cfg: Config, **extras: Any) -> Config:
         return merged
 
     cfg.to_kwargs = _merged_to_kwargs  # type: ignore[attr-defined]
+    # Also surface extras as attributes for status printing / dumps
     for k, v in extras.items():
         setattr(cfg, k, v)
     return cfg
@@ -88,8 +96,8 @@ def _cfg_with_extras(cfg: Config, **extras: Any) -> Config:
 def _load_config_file(path: str | None) -> Dict[str, Any]:
     """
     Load training defaults from a config file.
-      - TOML (.toml) via stdlib 'tomllib' (Python 3.11+)
-      - JSON (.json) via stdlib 'json'
+      • TOML (.toml) via stdlib 'tomllib' (Python 3.11+)
+      • JSON (.json) via stdlib 'json'
     """
     if not path:
         return {}
@@ -102,7 +110,9 @@ def _load_config_file(path: str | None) -> Dict[str, Any]:
         try:
             import tomllib  # Python 3.11+
         except Exception as e:
-            raise RuntimeError("TOML config requested but 'tomllib' is unavailable (requires Python 3.11+).") from e
+            raise RuntimeError(
+                "TOML requested, but 'tomllib' is unavailable (requires Python 3.11+)."
+            ) from e
         return tomllib.loads(p.read_text())
     raise ValueError(f"unsupported config format for {path} (use .toml or .json)")
 
@@ -155,7 +165,7 @@ def _preflight_summary(kind: str, cfg: Config) -> None:
 
 
 def _env_report() -> Dict[str, Any]:
-    """Collect a small environment report (safe on systems without CUDA)."""
+    """Collect a small environment report (safe on systems without CUDA/MPS)."""
     try:
         import torch
         cuda_ok = torch.cuda.is_available()
@@ -175,7 +185,9 @@ def _env_report() -> Dict[str, Any]:
         return {"error": f"environment probe failed: {e!r}"}
 
 
-# --------------------------- CLI ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     fmt = argparse.RawTextHelpFormatter
@@ -184,9 +196,9 @@ def main() -> None:
         description=(
             "ElementFold coherence engine CLI\n"
             "• Train → save a checkpoint, with progress\n"
-            "• Infer → decode either via language adapter (--prompt) or raw tokens\n"
+            "• Infer → decode via language adapter (--prompt) or raw tokens\n"
             "• Studio → interactive steering loop in the terminal\n"
-            "• Doctor → environment sanity check (CUDA/CPU)\n"
+            "• Doctor → environment sanity check (CUDA/CPU/MPS)\n"
             "• Steering‑train → tiny supervised controller on synthetic pairs"
         ),
         formatter_class=fmt,
@@ -210,13 +222,9 @@ def main() -> None:
     pt.add_argument("--steps", type=int, default=None,
                     help="Optimization steps (default: 200; or from --config).")
     pt.add_argument("--print-every", type=int, default=None,
-                    help="Print progress every N steps (omit for silent loop).")
+                    help="Print progress every N steps (omit for a quiet loop).")
     pt.add_argument("--out", type=str, default=None,
                     help="Checkpoint output path. If a directory or missing extension, saves to <path>/checkpoint.pt.")
-    pt.add_argument("--save", type=str, default=None,
-                    help="[Deprecated] Same as --out.")
-    pt.add_argument("--resume", type=str, default=None,
-                    help="Resume training from an Engine checkpoint (continues with the saved config).")
     # Model/data geometry
     pt.add_argument("--seq_len", type=int, default=None, help="Sequence length.")
     pt.add_argument("--vocab", type=int, default=None, help="Vocabulary size.")
@@ -231,7 +239,7 @@ def main() -> None:
     pt.add_argument("--no-data", action="store_true",
                     help="Disable the DataLoader and use synthetic tokens (fast smoke test).")
 
-    # ★ Rung controller (center‑stage) — train-time controls
+    # ★ Rung controller (train‑time controls)
     pt.add_argument("--rung-intent", type=str, choices=("stabilize", "seek", "hold"), default="stabilize",
                     help="Rung strategy: stabilize near rungs, seek safe disalignment, or hold tight.")
     pt.add_argument("--rung-target-k", type=int, default=None,
@@ -239,28 +247,28 @@ def main() -> None:
     pt.add_argument("--rung-band", type=float, default=None,
                     help="Acceptance half‑band in X (default: δ⋆/6 if omitted).")
     pt.add_argument("--rung-loss-weight", type=float, default=0.0,
-                    help="Optional loss shaping weight; 0.0 disables rung penalty.")
+                    help="Optional loss shaping weight; 0.0 disables the rung penalty.")
 
     # --------------------- Infer ---------------------
     pi = sub.add_parser(
         "infer",
-        help="Run inference (greedy or sampling); with --prompt uses the language adapter",
+        help="Run inference (greedy or sampling). With --prompt, routes through the language adapter.",
         formatter_class=fmt,
     )
     pi.add_argument("--ckpt", type=str, default=None,
                     help="Checkpoint to load (Engine.save format). If omitted, we train briefly, then infer.")
     pi.add_argument("--prompt", type=str, default=None,
-                    help="Text prompt; routes through the language adapter when set.")
+                    help="Text prompt → language adapter. Without it, we decode raw tokens.")
     pi.add_argument("--strategy", type=str, default="greedy", choices=("greedy", "sample"),
                     help="Decode strategy.")
     pi.add_argument("--temperature", type=float, default=1.0,
                     help="Sampling temperature when --strategy=sample.")
     pi.add_argument("--top-k", type=int, default=None, dest="top_k",
-                    help="Top‑k sampling cutoff (sampling only).")
+                    help="Top‑k cutoff (sampling only).")
     pi.add_argument("--top-p", type=float, default=None, dest="top_p",
-                    help="Top‑p (nucleus) sampling cutoff (sampling only).")
+                    help="Top‑p (nucleus) cutoff (sampling only).")
     # Quick train‑then‑infer controls if no ckpt
-    pi.add_argument("--config", type=str, default=None, help="Optional config (.toml/.json) for the temp training.")
+    pi.add_argument("--config", type=str, default=None, help="Optional config (.toml/.json) for the temporary training.")
     pi.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto",
                     help="Compute device (default: auto).")
     pi.add_argument("--steps", type=int, default=None, help="Temporary training steps (default: 200).")
@@ -276,7 +284,8 @@ def main() -> None:
     pi.add_argument("--capacities", type=str, default=None, help="Seat capacities.")
     pi.add_argument("--no-data", action="store_true", help="Use synthetic tokens (fast smoke test).")
     pi.add_argument("--out", type=str, default=None,
-                    help="If training happens here, optionally save the resulting checkpoint (same rules as train --out).")
+                    help="If training happens here, optionally save the resulting checkpoint.")
+
     # ★ Rung controller flags also apply to the temporary training path
     pi.add_argument("--rung-intent", type=str, choices=("stabilize", "seek", "hold"), default="stabilize",
                     help="Rung strategy during quick train if no --ckpt is provided.")
@@ -285,10 +294,10 @@ def main() -> None:
     pi.add_argument("--rung-loss-weight", type=float, default=0.0, help="Rung loss weight for quick train.")
 
     # --------------------- Studio ---------------------
-    ps = sub.add_parser("studio", help="Interactive steering Studio (terminal)")
+    sub.add_parser("studio", help="Interactive steering Studio (terminal)")
 
     # --------------------- Doctor ---------------------
-    pd = sub.add_parser("doctor", help="Environment diagnostics (CUDA/CPU/MPS, Torch versions)")
+    sub.add_parser("doctor", help="Environment diagnostics (CUDA/CPU/MPS, Torch versions)")
 
     # ---------------- Steering controller train ----------------
     ps2 = sub.add_parser(
@@ -298,7 +307,7 @@ def main() -> None:
     )
     ps2.add_argument("--steps", type=int, default=500, help="Optimization steps (default: 500).")
     ps2.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate (default: 1e-3).")
-    ps2.add_argument("--delta", type=float, default=0.030908106561043047, help="δ⋆ coherence unit (default ≈0.0309).")
+    ps2.add_argument("--delta", type=float, default=0.030908106561043047, help="δ⋆ (default ≈ 0.0309).")
     ps2.add_argument("--batch-size", type=int, default=16, dest="batch_size", help="Mini‑batch size (default: 16).")
     ps2.add_argument("--val-frac", type=float, default=0.1, help="Validation split fraction (default: 0.1).")
     ps2.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto",
@@ -329,26 +338,7 @@ def main() -> None:
         )
         _apply_config_defaults(args, cfg_dict, cfg_keys)
 
-        out_arg = args.out or args.save
         device = _coerce_device(args.device)
-
-        if args.resume:
-            if not Path(args.resume).exists():
-                raise FileNotFoundError(f"resume checkpoint not found: {args.resume}")
-            eng = Engine.from_checkpoint(args.resume)
-            # Merge runtime extras, including rung controls (override saved config if provided)
-            eng.cfg = _cfg_with_extras(
-                eng.cfg,
-                print_every=args.print_every,
-                out=out_arg,
-                rung_intent=args.rung_intent,
-                rung_target_k=args.rung_target_k,
-                rung_band=args.rung_band,
-                rung_loss_weight=args.rung_loss_weight,
-            )
-            _preflight_summary("resume", eng.cfg)
-            eng.fit()
-            return
 
         # Fresh config
         cfg = Config(
@@ -368,7 +358,7 @@ def main() -> None:
         cfg = _cfg_with_extras(
             cfg,
             print_every=args.print_every,
-            out=out_arg,
+            out=args.out,
             rung_intent=args.rung_intent,
             rung_target_k=args.rung_target_k,
             rung_band=args.rung_band,
@@ -376,11 +366,6 @@ def main() -> None:
         )
 
         _preflight_summary("train", cfg)
-
-        if args.dump_config:
-            Path(args.dump_config).write_text(json.dumps(cfg.to_kwargs(), indent=2))
-            print(f"✓ wrote resolved config to {args.dump_config}")
-
         eng = Engine(cfg)
         eng.fit()
         return
@@ -467,7 +452,10 @@ def main() -> None:
             print_every=args.print_every,
         )
         if args.out:
-            print(f"✓ SteeringController saved to {args.out if Path(args.out).suffix else Path(args.out) / 'checkpoint.pt'}")
+            # If a directory was given, follow the convention used elsewhere.
+            outp = Path(args.out)
+            final = outp if outp.suffix else (outp / "checkpoint.pt")
+            print(f"✓ SteeringController saved to {final}")
         else:
             print("✓ SteeringController training done (no save path provided)")
         return

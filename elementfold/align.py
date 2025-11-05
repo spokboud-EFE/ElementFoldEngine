@@ -1,77 +1,142 @@
 # ElementFold · align.py
-# Goal: teach the model to keep phases aligned on the δ⋆ circle without a tunable temperature.
-# We do this by comparing each sample x to:
-#   • positives: legal micro‑shifts inside the same click (seat steps), plus tiny noise,
+# ──────────────────────────────────────────────────────────────────────────────
+# Goal (plain words)
+# ------------------
+# Teach the model to keep phases aligned on the δ⋆ circle **without** a fiddly
+# temperature. We compare each sample x against:
+#   • positives: tiny, legal seat steps that stay within one click (micro‑shifts),
 #   • negatives: half‑click moves (±δ⋆/2), where similarity should be minimal.
-# The cosine character kernel acts as the exact circular similarity; exp() turns it into a soft score.
+#
+# Geometry (exact, not approximate)
+# ---------------------------------
+# The cosine character kernel is the exact circular similarity:
+#     κ(x,y) = cos(2π(x−y)/δ⋆).
+# Turning κ into exp(κ) gives a soft score that lives in [e^{−1}, e^{+1}].
+#
+# Loss (temperature‑free)
+# -----------------------
+# For each sample we aggregate positives and negatives via log‑sum‑exp and take
+#    ℒ = − E_b [ log Σ_pos e^{κ⁺} − log Σ_neg e^{κ⁻} ].
+# δ⋆ sets the natural scale; no temperature knob is needed.
 
-import torch, torch.nn as nn, math           # Tensors, modules, and π for clarity (π used via ledger if needed)
-from .ledger import char_kernel              # κ_char(x,y) = cos(2π(x−y)/δ⋆) — exact periodic similarity
+from __future__ import annotations
+import math
+import torch
+import torch.nn as nn
+
+from .ledger import char_kernel  # κ(x,y) = cos(2π(x−y)/δ⋆)
 
 
-class AlignHead(nn.Module):                  # A small head that produces a temperature‑free contrastive loss
-    def __init__(self, delta):               # Accept δ⋆ so geometry is fixed by physics, not by tuning
-        super().__init__()                   # Standard module init
-        self.delta = float(delta)            # Cache δ⋆ as float for speed and clarity
+class AlignHead(nn.Module):
+    """
+    A tiny, temperature‑free contrastive head on the δ⋆ circle.
+
+    Construction:
+        AlignHead(delta)
+
+    Call:
+        loss, pos_score, neg_score = align(x, capacities, num_pos=2, num_neg=8, noise=0.02)
+
+    Where:
+        • x:           (B,) or (B,T) ledger positions; if (B,T) we reduce to (B,) by mean over T.
+        • capacities:  per‑sample seat capacities (C); can be a scalar, (B,), or “other”.
+                       If shape does not match {1, B}, we fall back to max(C) across the input.
+        • num_pos:     how many positive micro‑shifts to sample per sample (small is fine).
+        • num_neg:     how many negatives near ±δ⋆/2 per sample.
+        • noise:       small additive jitter in *ledger units* (stays tiny).
+        • neg_jitter:  std of the half‑click jitter as a fraction of δ⋆ (moderate, default 0.20).
+
+    Returns:
+        (loss, pos_score, neg_score)
+            loss:       scalar tensor
+            pos_score:  float, average exp(κ) over positive pairs (higher is better)
+            neg_score:  float, average exp(κ) over negative pairs (lower is better)
+    """
+
+    def __init__(self, delta: float):
+        super().__init__()
+        self.delta = float(delta)
 
     def forward(
         self,
-        x,                                   # Input ledger positions; shape (B,) or (B,T) before reduction
-        capacities,                          # Seat capacities; scalar, (B,), or any broadcastable form
-        num_pos=2,                           # How many positive micro‑shifts per sample
-        num_neg=8,                           # How many negative half‑click shifts per sample
-        noise=0.02,                          # Small additive jitter to avoid degenerate symmetry ties
+        x: torch.Tensor,                   # (B,) or (B,T)
+        capacities,                        # scalar, (B,), or broadcastable; fallback = max(C)
+        num_pos: int = 2,
+        num_neg: int = 8,
+        noise: float = 0.02,               # tiny additive noise in ledger units
+        neg_jitter: float = 0.20,          # fraction of δ⋆ for half‑click jitter (keeps negatives “near” ±½δ⋆)
     ):
-        # ——— 1) Make x a simple (B,) vector of ledger positions ————————————————
-        if x.dim() > 1:                      # If we are given a sequence (B,T) of ledger scalars …
-            x = x.mean(dim=1)                # … average over time to get a single representative phase per sample.
-        B = x.shape[0]                       # Batch size for all sampling below.
+        # ——— 1) Reduce sequences to one phase per sample (if needed) ————————
+        if x.dim() > 1:
+            x = x.mean(dim=1)              # (B,T) → (B,)
+        B = int(x.shape[0])
+        dev = x.device
+        dtype = x.dtype
 
-        # ——— 2) Build a per‑sample capacity vector caps_b of length B ————————————
-        caps = capacities if torch.is_tensor(capacities) else torch.as_tensor(capacities, device=x.device)
-        caps = caps.to(device=x.device)      # Move to the same device as x for arithmetic
-        if caps.numel() == 1:                # If one number (e.g., C=6) was given …
-            caps_b = caps.view(1).expand(B)  # … broadcast it to every sample in the batch.
-        elif caps.numel() == B:              # If a capacity per sample was provided …
-            caps_b = caps                    # … use it as‑is.
-        else:                                # Otherwise (mismatch), fall back to a safe upper bound …
-            caps_b = caps.max().view(1).expand(B)  # … by using the maximum capacity for all samples.
-        caps_b = caps_b.clamp_min(1)         # Never allow zero capacity; keep geometry well‑defined.
+        # ——— 2) Capacity handling (robust, user‑friendly) ————————————————
+        # Make 'caps_b' a (B,) vector of per‑sample capacities.
+        caps = capacities if torch.is_tensor(capacities) else torch.as_tensor(capacities)
+        caps = caps.to(device=dev)
+        if caps.numel() == 1:
+            caps_b = caps.view(1).expand(B)
+        elif caps.numel() == B:
+            caps_b = caps
+        else:
+            # Mismatch: use a conservative upper bound (max capacity).
+            caps_b = caps.max().view(1).expand(B)
+        caps_b = caps_b.clamp_min(1).to(torch.int64)     # C ≥ 1, keep it integral
 
-        # Compute the per‑sample seat step Δ_b = δ⋆ / C_b as a (B,) vector.
-        invC = (self.delta / caps_b.float()) # This is how far one seat moves inside the click for each sample.
+        # Seat step per sample: Δ_b = δ⋆ / C_b  (shape (B,))
+        delta = self.delta
+        delta_t = torch.as_tensor(delta, device=dev, dtype=dtype)
+        step_b = (delta_t / caps_b.to(dtype))            # Δ per sample
 
-        # ——— 3) Sample POSITIVES: legal micro‑shifts within the same click —————————
-        Cmax = int(caps_b.max().item())      # We sample in a unified range and then wrap per sample.
-        if Cmax < 1:                         # Guard: if something went wrong with capacities, default to 1.
-            Cmax = 1
-        # Draw integer seat offsets a ∈ {0..Cmax−1} for each positive and sample; shape (num_pos, B).
-        a = torch.randint(0, Cmax, (num_pos, B), device=x.device)
-        a = torch.remainder(a, caps_b.unsqueeze(0))            # Wrap per sample to its own capacity
-        a = a.to(x.dtype)                                      # Use same dtype as x for arithmetic below
-        # Add those steps to x with tiny noise ε ~ N(0, noise²). Shapes broadcast to (num_pos, B).
-        g_pos = x.unsqueeze(0) + a * invC.unsqueeze(0) + noise * torch.randn_like(a)
+        # ——— 3) POSITIVES: micro‑shifts (± small seat counts) within a click ——
+        # We restrict to tiny offsets so positives really are “close” on the circle.
+        # Let M_b = max(1, ⌊C_b/6⌋): at most ~δ⋆/6 away.
+        M_b = torch.clamp(caps_b // 6, min=1)           # (B,)
+        if num_pos < 1:
+            num_pos = 1
 
-        # ——— 4) Sample NEGATIVES: half‑click away (±δ⋆/2), plus moderate noise ——————
-        half = 0.5 * self.delta                                # The place of minimal cosine similarity on the circle
-        # Draw random signs s ∈ {−1,+1} for each negative and sample; shape (num_neg, B).
-        s = (torch.randint(0, 2, (num_neg, B), device=x.device) * 2 - 1).to(x.dtype)
-        # Add ±½δ⋆ plus a broader jitter to avoid trivial alignment at exact antipodes.
-        g_neg = x.unsqueeze(0) + s * half + (0.25 * self.delta) * torch.randn_like(s)
+        # Sample magnitudes m ∈ {1,…,M_b} and random signs s ∈ {−1,+1} per (pos, sample).
+        # Use a uniform draw via continuous trick: floor(u*M_b)+1, with u∈[0,1).
+        u = torch.rand(num_pos, B, device=dev)
+        m = torch.floor(u * M_b.unsqueeze(0).to(dtype=u.dtype)).to(torch.int64) + 1
+        s_pos = (torch.randint(0, 2, (num_pos, B), device=dev, dtype=torch.int64) * 2 - 1)
 
-        # ——— 5) Similarities via the character kernel (exact circular geometry) —————
-        # Broadcasting: x[None,:] is (1,B); g_pos is (num_pos,B); result is (num_pos,B)
-        sim_pos = char_kernel(x.unsqueeze(0), g_pos, self.delta)  # High when aligned modulo the click
-        sim_neg = char_kernel(x.unsqueeze(0), g_neg, self.delta)  # Low (≈−1) near ±½δ⋆
-        # Turn similarities into soft scores in [e^{−1}, e^{+1}] and reduce over the positives/negatives.
-        sp = sim_pos.exp().sum(dim=0)                            # Σ_pos exp(κ⁺) → (B,)
-        sn = sim_neg.exp().sum(dim=0)                            # Σ_neg exp(κ⁻) → (B,)
+        # Build positive targets g_pos = x + s·m·Δ + ε, broadcasting Δ per sample.
+        # Noise is tiny, unscaled (ledger units); shape aligns with (num_pos, B).
+        g_pos = (
+            x.unsqueeze(0).to(dtype)
+            + (s_pos * m).to(dtype) * step_b.unsqueeze(0)
+            + noise * torch.randn(num_pos, B, device=dev, dtype=dtype)
+        )
 
-        # ——— 6) Temperature‑free contrastive objective ————————————————
-        # Instead of dividing by a temperature τ, we rely on δ⋆ as the physical scale baked into κ_char.
-        num = sp.clamp_min(1e-9)                                  # Safety: avoid log(0)
-        den = sn.clamp_min(1e-9)                                  # Safety: avoid log(0)
-        loss = -(num / den).log().mean()                          # ℒ = −E_b[log(Σ⁺/Σ⁻)]
+        # ——— 4) NEGATIVES: near half‑click (±½δ⋆) with moderate jitter ————————
+        if num_neg < 1:
+            num_neg = 1
+        s_neg = (torch.randint(0, 2, (num_neg, B), device=dev, dtype=torch.int64) * 2 - 1).to(dtype)
+        half = 0.5 * delta_t
+        neg_sigma = float(neg_jitter) * delta
+        g_neg = (
+            x.unsqueeze(0).to(dtype)
+            + s_neg * half
+            + neg_sigma * torch.randn(num_neg, B, device=dev, dtype=dtype)
+        )
 
-        # ——— 7) Return both scalar loss and simple diagnostics ———————————————
-        return loss, sp.mean().item(), sn.mean().item()           # Loss, average positive score, average negative score
+        # ——— 5) Similarities on the circle (exact periodic geometry) ————————
+        # Shapes: x[None,:] → (1,B); g_pos → (P,B); g_neg → (N,B)
+        sim_pos = char_kernel(x.unsqueeze(0), g_pos, delta)  # (P,B) in [−1,1]
+        sim_neg = char_kernel(x.unsqueeze(0), g_neg, delta)  # (N,B) in [−1,1]
+
+        # ——— 6) Temperature‑free contrast using log‑sum‑exp (stable) ————————
+        # sp = log Σ_pos exp(sim_pos), sn = log Σ_neg exp(sim_neg)
+        sp = torch.logsumexp(sim_pos, dim=0)                 # (B,)
+        sn = torch.logsumexp(sim_neg, dim=0)                 # (B,)
+        loss = -(sp - sn).mean()
+
+        # Diagnostic scores (nice to log): average exp(κ⁺) and exp(κ⁻).
+        pos_score = torch.exp(sim_pos).mean().item()
+        neg_score = torch.exp(sim_neg).mean().item()
+
+        return loss, pos_score, neg_score

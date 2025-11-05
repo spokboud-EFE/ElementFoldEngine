@@ -1,177 +1,292 @@
 # ElementFold · ledger.py
-# This file is the “geometry of coherence.” It turns any real value x into a point on a circle of size δ⋆,
-# gives you the nearest click (rung) and the leftover offset (residual), measures distances on that circle,
-# and provides kernels and simple identities that every layer of the engine uses.
+# ──────────────────────────────────────────────────────────────────────────────
+# Geometry of coherence — the δ⋆ circle
+#
+# This module is the “small math” behind ElementFold:
+#   • phase(x, δ⋆)          : map any real x to the unit circle e^{i·2πx/δ⋆}
+#   • rung_residual(x, δ⋆)  : split x = k·δ⋆ + r with r ∈ (−½δ⋆, ½δ⋆]
+#   • wrapped_distance      : shortest arc length on the circle (always ≤ ½δ⋆)
+#   • periodic_mean / lerp  : circular mean and interpolation along the short arc
+#   • seat_index[_int]      : continuous / integer seat indices within a click
+#   • char_kernel / vm_kernel: exact cosine kernel and a smooth von‑Mises kernel
+#   • invariants + checks   : tiny gauge‑free identities used across the codebase
+#   • kappa / p_half        : coherence and half‑click contact rate (telemetry staples)
+#
+# All functions are vectorized (broadcasting like PyTorch ops), device‑agnostic,
+# and carefully documented for non‑experts. No heavy dependencies.
 
-import torch, math  # We import PyTorch for tensors and math for π and basic constants.
+from __future__ import annotations
 
-# ————————————————————————————————————————————————
+import math
+import torch
+
+__all__ = [
+    "phase", "rung_residual", "half_click_margin", "snap_to_rung",
+    "seat_index", "seat_index_int",
+    "wrapped_distance", "periodic_mean", "periodic_lerp",
+    "char_kernel", "vm_kernel",
+    "invariants", "check_identities",
+    "kappa", "p_half",
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Core circular mapping
-# ————————————————————————————————————————————————
+# ──────────────────────────────────────────────────────────────────────────────
 
-def phase(x, delta):
+def phase(x: torch.Tensor | float, delta: float) -> torch.Tensor:
     """
-    Map a real position x onto the unit circle using the click δ⋆ as the period.
-    Returns a complex tensor on the unit circle, i.e., e^{i·2πx/δ⋆}.
+    Map a real position x onto the unit circle with period δ⋆ (delta).
+
+        ϕ(x) = e^{i·2πx/δ⋆}
+
+    Args:
+        x:     real scalar or tensor (any broadcastable shape).
+        delta: positive float — the fundamental “click” size δ⋆.
+
+    Returns:
+        Complex tensor with |ϕ| = 1 (dtype: complex64/complex128 based on x).
     """
-    a = (2 * math.pi / delta) * x            # Convert “distance along the ledger” into an angle in radians.
-    one = torch.ones_like(a, dtype=a.dtype)  # Build a tensor of ones so we can form a complex number with magnitude 1.
-    return torch.polar(one, a)               # Construct complex numbers from (radius=1, angle=a). This lives exactly on the circle.
+    a = (2.0 * math.pi / float(delta)) * torch.as_tensor(x, dtype=torch.get_default_dtype())
+    one = torch.ones_like(a)
+    return torch.polar(one, a)  # radius=1, angle=a
 
 
-def rung_residual(x, delta):
+def rung_residual(x: torch.Tensor | float, delta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    Decompose x into an integer rung k and a signed residual r within the current click:
+
+        x = k·δ⋆ + r,   with   r ∈ (−½δ⋆, ½δ⋆]   (open on the left, closed on the right).
+
+    Why this interval? Having +½δ⋆ included and −½δ⋆ excluded removes a double‑count at the boundary.
+
+    Implementation details:
+      • We first do “round to nearest” with a symmetric trick k = ⌊x/δ⋆ + 0.5⌋.
+      • Then we normalize the rare exact left‑edge case r = −½δ⋆ → (+½δ⋆, k−1)
+        so r always obeys (−½δ⋆, ½δ⋆].
+
+    Args:
+        x:     real scalar or tensor.
+        delta: click size δ⋆.
+
+    Returns:
+        (k, r): integer tensor k (int64) and residual tensor r (same dtype as x).
     """
-    Split x into (k, r) where k is the integer number of clicks and r is the signed
-    residual inside the current click. The residual is always in (−½δ⋆, ½δ⋆].
+    x_t = torch.as_tensor(x, dtype=torch.get_default_dtype())
+    d = float(delta)
+
+    # Round to nearest integer rung index (works for negative x as well).
+    k = torch.floor((x_t / d) + 0.5).to(torch.int64)
+    r = x_t - k.to(x_t.dtype) * d
+
+    # Normalize exact left edge to the right edge so r ∈ (−½δ⋆, ½δ⋆]
+    half = d / 2.0
+    cond = r <= -half  # extremely rare unless x sits exactly at the boundary
+    if cond.any():
+        r = torch.where(cond, r + d, r)
+        k = torch.where(cond, k - 1, k)
+
+    return k, r
+
+
+def half_click_margin(x: torch.Tensor | float, delta: float) -> torch.Tensor:
     """
-    k = torch.floor((x / delta) + 0.5).to(torch.int64)  # Round x/δ⋆ to the nearest integer by adding 0.5 and taking floor.
-    r = x - k.to(x.dtype) * delta                       # Remove k clicks from x to get the leftover within the current click.
-    return k, r                                         # Return both pieces: the “lap count” k and the “within‑lap” offset r.
+    Safety gap to the seat boundary (½δ⋆ from the center of a click):
 
+        margin = ½δ⋆ − |r|
 
-def half_click_margin(x, delta):
+    Positive margin ⇒ “safe” (small perturbations won’t flip the rung).
+    Negative margin ⇒ already beyond the boundary.
+
+    Returns:
+        Tensor, same shape as x, real.
     """
-    How far x is from the nearest boundary between clicks (½δ⋆ away from the center).
-    Positive margin means “safe” (will round to the same k under small noise).
+    _, r = rung_residual(x, delta)
+    return (float(delta) / 2.0) - r.abs()
+
+
+def snap_to_rung(x: torch.Tensor | float, delta: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    _, r = rung_residual(x, delta)                      # Get the within‑click residual.
-    return (delta / 2) - r.abs()                        # Margin = half a click minus how far we currently are from center.
+    Snap x to its nearest click center k·δ⋆.
 
-
-def snap_to_rung(x, delta):
+    Returns:
+        (x_snap, k, r) where:
+          • x_snap = k·δ⋆ (exact center),
+          • k      = integer rung index,
+          • r      = residual within the click, r ∈ (−½δ⋆, ½δ⋆].
     """
-    Snap x onto its nearest click center k·δ⋆. Returns the snapped value, k, and r.
+    k, r = rung_residual(x, delta)
+    x_snap = k.to(r.dtype) * float(delta)
+    return x_snap, k, r
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Seats inside a click (C “seats” partition one click)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def seat_index(x: torch.Tensor | float, delta: float, C: int) -> torch.Tensor:
     """
-    k, r = rung_residual(x, delta)                      # Use the same decomposition into integer clicks and residual.
-    x_snap = k.to(x.dtype) * delta                      # Reconstruct the snapped position on the exact click center.
-    return x_snap, k, r                                 # Provide all three: snapped x, integer rung, and residual.
+    Continuous seat coordinate within a click with capacity C (e.g., C=6 → hexagonal),
+    reported in [0, C).
 
-
-# ————————————————————————————————————————————————
-# Seats inside a click
-# ————————————————————————————————————————————————
-
-def seat_index(x, delta, C):
+    Implementation:
+        s = (C/δ⋆)·x   wrapped into [0, C) with remainder.
     """
-    Continuous seat coordinate inside a click with capacity C (e.g., C=6 means hexagonal),
-    measured in the range [0, C). This is the fractional seat position, not rounded to an integer.
+    x_t = torch.as_tensor(x, dtype=torch.get_default_dtype())
+    C = int(C)
+    s = (C / float(delta)) * x_t
+    return torch.remainder(s, C)
+
+
+def seat_index_int(x: torch.Tensor | float, delta: float, C: int) -> torch.Tensor:
     """
-    return ((C / delta) * x).remainder(C)               # Scale x by C/δ⋆ and wrap into one revolution with remainder C.
+    Integer seat index in {0, 1, …, C−1} by *nearest* rounding in seat units.
 
-
-def seat_index_int(x, delta, C):
+    We round with the same symmetric trick as rungs and then wrap into the valid range.
     """
-    Integer seat index (0,1,...,C−1) by rounding to the nearest seat within the click.
-    Useful when you need a discrete label instead of a continuous coordinate.
-    """
-    s = (C / delta) * x                                 # Convert x to “seat units” so one click spans exactly C seats.
-    idx = torch.floor(s + 0.5).to(torch.int64)          # Round to the nearest seat with the same trick as rung rounding.
-    return torch.remainder(idx, int(C))                 # Wrap it into {0,...,C−1} so seat indices loop around cleanly.
+    x_t = torch.as_tensor(x, dtype=torch.get_default_dtype())
+    C = int(C)
+    s = (C / float(delta)) * x_t
+    idx = torch.floor(s + 0.5).to(torch.int64)
+    return torch.remainder(idx, C)
 
 
-# ————————————————————————————————————————————————
+# ──────────────────────────────────────────────────────────────────────────────
 # Distances and averages on the circle
-# ————————————————————————————————————————————————
+# ──────────────────────────────────────────────────────────────────────────────
 
-def wrapped_distance(x, y, delta):
+def wrapped_distance(x: torch.Tensor | float, y: torch.Tensor | float, delta: float) -> torch.Tensor:
     """
-    The shortest arc length between x and y on the circle of size δ⋆.
-    Always returns a value in [0, ½δ⋆].
+    Shortest arc length between x and y on the δ⋆ circle (always in [0, ½δ⋆]).
+
+    We compute the difference, wrap into (−½δ⋆, ½δ⋆], then take |·|.
     """
-    d = (x - y).remainder(delta)                        # First wrap the raw difference into [0, δ⋆).
-    half = delta / 2                                    # Half a click is the boundary between “go left” and “go right”.
-    d = torch.where(d > half, d - delta, d)             # If we overshot to the right, step one full circle left.
-    d = torch.where(d < -half, d + delta, d)            # If we overshot to the left, step one full circle right.
-    return d.abs()                                      # We only care about the arc length, not the direction.
+    x_t = torch.as_tensor(x, dtype=torch.get_default_dtype())
+    y_t = torch.as_tensor(y, dtype=torch.get_default_dtype())
+    d = (x_t - y_t).remainder(float(delta))              # [0, δ⋆)
+    half = float(delta) / 2.0
+    d = torch.where(d > half, d - float(delta), d)       # → (−½δ⋆, ½δ⋆]
+    return d.abs()
 
 
-def periodic_mean(x, delta):
+def periodic_mean(x: torch.Tensor | float, delta: float) -> torch.Tensor:
     """
-    The average of many points on a circle is not a simple arithmetic mean; it’s a circular mean.
-    We average unit phases and convert the mean phase back to a position in [0, δ⋆).
+    Circular mean of points on the δ⋆ circle:
+      1) map to unit circle,
+      2) average complex numbers,
+      3) convert angle back to [0, δ⋆).
+
+    Returns:
+        Real scalar tensor in [0, δ⋆).
     """
-    ph = phase(x, delta)                                # Map each x to its unit complex point on the circle.
-    ph_mean = ph.mean()                                 # Average in the complex plane to keep angles consistent.
-    ang = torch.angle(ph_mean)                          # Extract the angle of the average complex number in radians.
-    pos = (ang * delta) / (2 * math.pi)                 # Convert the angle back to “ledger distance” in units of δ⋆.
-    return pos.remainder(delta)                         # Wrap into [0, δ⋆) to stay on the ledger.
+    ph = phase(x, delta)
+    ph_mean = ph.mean()
+    ang = torch.angle(ph_mean)                           # (−π, π]
+    pos = (ang * float(delta)) / (2.0 * math.pi)
+    return pos.remainder(float(delta))
 
 
-def periodic_lerp(x, y, w, delta):
+def periodic_lerp(x: torch.Tensor | float, y: torch.Tensor | float, w: float, delta: float) -> torch.Tensor:
     """
-    Interpolate from x to y along the shortest arc on the circle. The weight w∈[0,1]
-    chooses the point w of the way along that shortest path.
+    Interpolate from x to y along the *shortest* circular arc with weight w ∈ [0,1].
+
+    Implementation: move (y−x) into (−½δ⋆, ½δ⋆], then take x + w·that, wrapped back to [0, δ⋆).
     """
-    d = (y - x)                                         # Start with the direct difference.
-    # Move the difference into the shortest direction by wrapping into (−½δ⋆, ½δ⋆].
-    d = (d + delta / 2).remainder(delta) - (delta / 2)  # This centers the residual so it is symmetric around zero.
-    return (x + w * d).remainder(delta)                 # Take a partial step and wrap to stay on the circle.
+    x_t = torch.as_tensor(x, dtype=torch.get_default_dtype())
+    y_t = torch.as_tensor(y, dtype=torch.get_default_dtype())
+    d = (y_t - x_t)                                      # raw difference
+    d = (d + float(delta) / 2.0).remainder(float(delta)) - (float(delta) / 2.0)  # (−½δ⋆, ½δ⋆]
+    z = x_t + float(w) * d
+    return torch.remainder(z, float(delta))
 
 
-# ————————————————————————————————————————————————
+# ──────────────────────────────────────────────────────────────────────────────
 # Circular kernels (how “in tune” two positions are)
-# ————————————————————————————————————————————————
+# ──────────────────────────────────────────────────────────────────────────────
 
-def char_kernel(x, y, delta):
+def char_kernel(x: torch.Tensor | float, y: torch.Tensor | float, delta: float) -> torch.Tensor:
     """
-    The simplest exact circular similarity: cos(2π(x−y)/δ⋆).
-    Equals 1 when x and y coincide on the circle, and −1 when they are half a click apart.
-    """
-    return torch.cos(2 * math.pi * (x - y) / delta)     # Compute cosine of the normalized angular difference.
+    Exact circular similarity (character of the 1‑D representation):
 
+        K(x, y) = cos(2π(x−y)/δ⋆)
 
-def vm_kernel(x, y, delta):
+    Equals +1 when x and y coincide and −1 when they are half a click apart.
     """
-    A smooth, positive kernel on the circle: exp(cos(2π(x−y)/δ⋆)).
-    Often called a von Mises kernel; it respects periodicity exactly.
-    """
-    return torch.exp(torch.cos(2 * math.pi * (x - y) / delta))  # Turn cosine into a soft, always‑positive similarity.
+    x_t = torch.as_tensor(x, dtype=torch.get_default_dtype())
+    y_t = torch.as_tensor(y, dtype=torch.get_default_dtype())
+    return torch.cos(2.0 * math.pi * (x_t - y_t) / float(delta))
 
 
-# ————————————————————————————————————————————————
-# Invariants and simple checks
-# ————————————————————————————————————————————————
+def vm_kernel(x: torch.Tensor | float, y: torch.Tensor | float, delta: float) -> torch.Tensor:
+    """
+    Smooth, positive kernel on the circle (von Mises–type):
 
-def invariants(U):
+        K(x, y) = exp( cos(2π(x−y)/δ⋆) )
+
+    Peaks at 1 when x=y and decays smoothly as the wrapped distance grows.
     """
-    Given a potential U, the four canonical channels are exponentials of ±U and ±2U.
-    We return three of them: Γ (clock), n (index), I (intensity).
-    """
-    Gam = torch.exp(+U)                                 # Clock factor grows like e^{+U}.
-    nidx = torch.exp(-2 * U)                            # Refractive index grows like e^{−2U}.
-    I = torch.exp(+2 * U)                               # Intensity grows like e^{+2U}.
-    return Gam, nidx, I                                 # These satisfy simple multiplicative identities.
+    x_t = torch.as_tensor(x, dtype=torch.get_default_dtype())
+    y_t = torch.as_tensor(y, dtype=torch.get_default_dtype())
+    return torch.exp(torch.cos(2.0 * math.pi * (x_t - y_t) / float(delta)))
 
 
-def check_identities(U, eps=1e-6):
+# ──────────────────────────────────────────────────────────────────────────────
+# Invariants and simple checks (tiny, handy utilities)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def invariants(U: torch.Tensor | float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Verify the gauge‑free identities:
-      Γ · n^{1/2} = 1  and  I · n = 1.
-    We return the absolute deviations from 1 so you can see how well the data obeys the law.
+    Gauge‑free channels built from a potential U (all pointwise):
+        Γ = e^{+U}      (clock)
+        n = e^{−2U}     (index)
+        I = e^{+2U}     (intensity)
+
+    Returns:
+        (Γ, n, I) as tensors broadcasting with U.
     """
-    Gam, n, I = invariants(U)                           # Compute the channels from U.
-    lhs1 = Gam * torch.sqrt(n)                          # Left side of the first identity.
-    lhs2 = I * n                                        # Left side of the second identity.
-    err1 = (lhs1 - 1.0).abs().max().item()             # Max absolute deviation for the first identity.
-    err2 = (lhs2 - 1.0).abs().max().item()             # Max absolute deviation for the second identity.
-    ok1 = err1 <= eps                                   # Within tolerance?
-    ok2 = err2 <= eps                                   # Within tolerance?
-    return {"err_Gam_nhalf": err1, "err_I_n": err2, "ok": bool(ok1 and ok2)}  # Report both errors and a combined pass flag.
+    U_t = torch.as_tensor(U, dtype=torch.get_default_dtype())
+    Gam = torch.exp(+U_t)
+    nidx = torch.exp(-2.0 * U_t)
+    I = torch.exp(+2.0 * U_t)
+    return Gam, nidx, I
 
 
-def kappa(x, delta):
+def check_identities(U: torch.Tensor | float, eps: float = 1e-6) -> dict:
     """
-    Phase concentration κ in [0,1]: how well a set of points aligns on the circle.
-    κ≈1 means all phases point the same way; κ≈0 means they are spread out.
+    Verify the simple multiplicative identities:
+        Γ · n^{1/2} ≈ 1   and   I · n ≈ 1.
+
+    Returns:
+        {'err_Gam_nhalf': max|Γ√n − 1|,
+         'err_I_n':      max|In − 1|,
+         'ok':           both ≤ eps}
     """
-    ph = phase(x, delta)                                # Turn positions into unit complex numbers.
-    return torch.abs(ph.mean()).item()                  # The magnitude of the mean complex vector is the concentration.
+    Gam, n, I = invariants(U)
+    lhs1 = Gam * torch.sqrt(n)
+    lhs2 = I * n
+    err1 = float((lhs1 - 1.0).abs().max().item())
+    err2 = float((lhs2 - 1.0).abs().max().item())
+    return {"err_Gam_nhalf": err1, "err_I_n": err2, "ok": bool(err1 <= eps and err2 <= eps)}
 
 
-def p_half(x, delta, eps=1e-9):
+# ──────────────────────────────────────────────────────────────────────────────
+# Telemetry primitives (coherence and boundary contact)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def kappa(x: torch.Tensor | float, delta: float) -> float:
     """
-    Fraction of samples that lie on or beyond the half‑click boundary (the seat boundary).
-    Larger values mean you are skimming the boundary and likely to “flip” to the next click.
+    Phase concentration κ ∈ [0,1]: magnitude of the mean unit‑phase vector.
+    κ≈1 means phases are tightly aligned; κ≈0 means they are spread out.
     """
-    _, r = rung_residual(x, delta)                      # Get residuals for each sample.
-    return (r.abs() >= (delta / 2 - eps)).float().mean().item()  # Count boundary touches and average to a fraction.
+    ph = phase(x, delta)
+    return float(torch.abs(ph.mean()).item())
+
+
+def p_half(x: torch.Tensor | float, delta: float, eps: float = 1e-9) -> float:
+    """
+    Fraction of samples on or beyond the half‑click boundary (i.e., |r| ≥ ½δ⋆ − ε).
+
+    A larger value means you are skimming the boundary and more likely to flip rungs.
+    """
+    _, r = rung_residual(x, delta)
+    return float((r.abs() >= (float(delta) / 2.0 - float(eps))).float().mean().item())

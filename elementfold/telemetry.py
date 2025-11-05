@@ -1,92 +1,161 @@
 # ElementFold · telemetry.py
-# Telemetry tells us if the system is in tune. We take raw ledger values X and report
-# a few small, meaningful numbers that summarize coherence on the δ⋆ circle:
-#   • κ (kappa): how tightly phases align (1 = perfectly aligned, 0 = spread out)
-#   • p_half: how often samples touch the half‑click boundary (risk of flipping rungs)
-#   • margins: safety gap to the boundary (mean / min)
-#   • residual stats: how wide the residuals are around their centers
-# If X is a sequence per sample (shape (B,T)), we also report how big the steps are along T.
+# ──────────────────────────────────────────────────────────────────────────────
+# Telemetry tells us if the system is “in tune.” From ledger values X we report
+# small, meaningful numbers on the δ⋆ circle:
+#   • κ (kappa)     — phase alignment strength (1 = tightly aligned, 0 = spread out)
+#   • p_half        — fraction touching the half‑click boundary (risk of flipping rungs)
+#   • margins       — safety gap to the boundary (mean / min)
+#   • residual spread — how wide residuals r are around their centers
+# If X is a short sequence per sample (shape (B,T)), we can also report step stats along T.
+#
+# The function returns canonical ASCII keys and friendly Unicode aliases so both
+# humans and code can read the same dict comfortably.
 
-import torch, math                           # PyTorch for tensors; math for π (used in angle→position conversion)
-from .ledger import phase, rung_residual, wrapped_distance  # Circular tools from the ledger
+from __future__ import annotations
 
-def measure(X, delta, eps=1e-9, detail=False):
+import math
+import torch
+
+from .ledger import phase, rung_residual, wrapped_distance  # circle tools (unit‑complex map, residuals, wrapped Δ)
+
+
+def _as_tensor(X: torch.Tensor | float) -> torch.Tensor:
+    """Coerce inputs to a float32 tensor (no device assumptions)."""
+    return torch.as_tensor(X, dtype=torch.float32)
+
+
+def _safe_item(x: torch.Tensor, default: float = 0.0) -> float:
+    """Extract a Python float, falling back to a default if x is empty or non‑finite."""
+    try:
+        v = float(x.item() if x.numel() == 1 else x)
+    except Exception:
+        v = default
+    if not math.isfinite(v):
+        v = default
+    return v
+
+
+def measure(
+    X: torch.Tensor,
+    delta: float,
+    eps: float = 1e-9,
+    detail: bool = False,
+) -> dict:
     """
     Compute coherence diagnostics on the δ⋆ circle.
 
     Args:
-        X:     Tensor of ledger values. Shape can be:
-               • (B,)  — one value per sample, or
-               • (B,T) — a short sequence per sample; we summarize each row.
-        delta: The fundamental click δ⋆ that defines the circle size.
-        eps:   A tiny tolerance when checking half‑click boundaries.
-        detail:If True and X has shape (B,T), also report step statistics along T.
+        X:
+            Ledger values. Typical shapes:
+              • (B,)   — one value per sample.
+              • (B,T)  — short sequence per sample (we summarize each row).
+            Other 1D/2D tensors are handled similarly; we avoid crashing on edge cases.
+        delta:
+            The fundamental click (δ⋆) that sets the circle size.
+        eps:
+            Tiny tolerance for “at the boundary” checks.
+        detail:
+            If True and X has shape (B,T) with T>1, also include step statistics along T.
 
     Returns:
         dict with scalar floats (and a few sizes if detail=True):
             {
               'kappa':      phase concentration in [0,1],
-              'p_half':     fraction at or beyond half‑click boundary,
-              'margin_mean':average safety gap to the boundary (larger is safer),
-              'margin_min': smallest safety gap (how close the worst sample gets),
+              'κ':          same as 'kappa' (Unicode alias),
+              'p_half':     fraction at/over the half‑click boundary,
+              'p½':         Unicode alias of 'p_half',
+              'margin_mean':average safety gap to the boundary (≥0, larger is safer),
+              'margin_min': smallest safety gap (can be negative → already over line),
               'resid_std':  standard deviation of residuals r,
               'phase_mean': average phase location on [0, δ⋆),
+              'delta':      δ⋆ as ASCII,
+              'δ⋆':          δ⋆ as Unicode,
               # if detail and X is (B,T):
-              'step_mean':  average wrapped step size between neighboring seats,
+              'step_mean':  average wrapped step between neighboring seats,
               'step_std':   std of those steps,
               'B': int(B), 'T': int(T)
             }
     """
-    # ——— 1) Reduce sequences (if any) to a single ledger value per sample ————————
-    if X.dim() == 2:                         # If we have (B,T) values per sample …
-        x = X.mean(dim=1)                    # … average over T to get a representative phase per sample.
-    else:                                    # Otherwise X is already (B,) or (T,)
-        x = X                                # … use it as‑is (broadcasts fine if (T,)).
+    X = _as_tensor(X)
+    delta = float(delta)
+
+    # ——— 1) Reduce sequences (if any) to one representative X per sample ———
+    # We accept:
+    #   (B,T) → mean over T (per‑sample phase representative)
+    #   (B,)  → as‑is
+    #   scalar → promote to (1,)
+    if X.ndim == 0:
+        X = X.view(1)
+    if X.ndim == 1:
+        x = X
+        B, T = int(X.shape[0]), 1
+    elif X.ndim >= 2:
+        # Only first two dims matter; extra dims (if any) are folded into B by view
+        B, T = int(X.shape[0]), int(X.shape[1])
+        x = X[:, :T].mean(dim=1)  # (B,)
+    else:
+        # Extremely unusual, but keep a safe default
+        x = X.reshape(-1)
+        B, T = int(x.shape[0]), 1
+
+    # Guard: empty input
+    if x.numel() == 0:
+        return {
+            "kappa": 0.0, "κ": 0.0,
+            "p_half": 0.0, "p½": 0.0,
+            "margin_mean": 0.0, "margin_min": 0.0,
+            "resid_std": 0.0,
+            "phase_mean": 0.0,
+            "delta": delta, "δ⋆": delta,
+            **({"B": 0, "T": 0} if detail else {}),
+        }
 
     # ——— 2) Phase concentration κ on the unit circle ————————————————
-    ph = phase(x, delta)                     # Map each x to a unit complex: e^{i·2πx/δ⋆}.
-    ph_mean = ph.mean()                      # Average those complex numbers to find the centroid on the circle.
-    kappa = torch.abs(ph_mean).item()        # κ = |centroid|; near 1 means phases are aligned.
+    # Map x ↦ e^{i·2πx/δ⋆}; κ is the magnitude of the centroid on the unit circle.
+    ph = phase(x, delta)                  # complex64/complex128 tensor on unit circle
+    ph_mean = ph.mean()                   # complex scalar
+    kappa = float(torch.abs(ph_mean).item())
 
-    # We also report where that mean phase sits on [0, δ⋆) (useful to detect global drift).
-    ang = torch.angle(ph_mean)               # Angle of the mean complex number in radians (−π, π].
-    phase_mean = float(((ang * delta) / (2 * math.pi)) % delta)  # Convert angle back into δ⋆ units and wrap.
+    # Where is the mean phase located? Report in δ⋆ units wrapped into [0, δ⋆).
+    ang = torch.angle(ph_mean)            # radians in (−π, π]
+    phase_mean = float(((ang * delta) / (2 * math.pi)) % delta)
 
     # ——— 3) Residuals within a click and boundary contact rate —————————
-    k, r = rung_residual(x, delta)           # x = k·δ⋆ + r, where r ∈ (−½δ⋆, ½δ⋆].
-    # p_half counts how often we are at or past the half‑click boundary (danger zone for rung flips).
-    p_half = (r.abs() >= (delta / 2 - eps)).float().mean().item()
+    # x = k·δ⋆ + r, with r ∈ (−½δ⋆, ½δ⋆].
+    _, r = rung_residual(x, delta)        # residuals around nearest rung
+    half = delta / 2.0
+    p_half = float((r.abs() >= (half - eps)).float().mean().item())
 
-    # Safety margin to the boundary: m = ½δ⋆ − |r| (clamped at 0 so negatives don’t average away the warning).
-    margin = (delta / 2) - r.abs()           # Positive = safe space left; negative would mean “already over the line”.
-    margin_clamped = torch.clamp_min(margin, 0.0)  # Never let negative margins hide risk in the average.
-    margin_mean = margin_clamped.mean().item()     # Average safety gap across samples.
-    margin_min = margin.min().item()               # Smallest (possibly negative) margin — the worst case.
+    # Safety margin to the boundary: m = ½δ⋆ − |r|
+    margin = half - r.abs()
+    margin_clamped = torch.clamp_min(margin, 0.0)  # don’t let negatives hide risk
+    margin_mean = float(margin_clamped.mean().item())
+    margin_min = float(margin.min().item())        # can be negative (over the line)
 
-    # Residual spread: how wide r values are around their centers (0 means everyone sits exactly on centers).
-    resid_std = (r.std(unbiased=False).item() if r.numel() > 1 else 0.0)
+    # Residual spread (0 means everyone sits exactly on centers)
+    resid_std = float(r.std(unbiased=False).item() if r.numel() > 1 else 0.0)
 
-    # Prepare the basic report.
     report = {
-        "kappa": kappa,                     # Phase alignment strength.
-        "p_half": p_half,                   # Boundary touch frequency.
-        "margin_mean": margin_mean,         # Average safety gap.
-        "margin_min": margin_min,           # Worst safety gap.
-        "resid_std": resid_std,             # Spread of residuals.
-        "phase_mean": phase_mean,           # Average phase position (for drift checks).
+        # Canonical keys
+        "kappa": kappa,
+        "p_half": p_half,
+        "margin_mean": margin_mean,
+        "margin_min": margin_min,
+        "resid_std": resid_std,
+        "phase_mean": phase_mean,
+        "delta": delta,
+        # Unicode aliases for friendly dashboards/CLIs
+        "κ": kappa,
+        "p½": p_half,
+        "δ⋆": delta,
     }
 
-    # ——— 4) Optional step statistics along T when sequences are provided ———————
-    if detail and X.dim() == 2 and X.size(1) > 1:  # Only meaningful if we had sequences (B,T) with T>1
-        # Wrapped steps between neighbors measure how “bumpy” the path is along the sequence dimension.
-        d = wrapped_distance(X[:, 1:], X[:, :-1], delta)  # Shortest circular distance seat‑to‑seat.
-        step_mean = d.mean().item()                       # Average step magnitude across all rows and positions.
-        step_std = d.std(unbiased=False).item()           # How variable those steps are.
-        report.update({
-            "step_mean": step_mean,                       # Typical local movement on the circle.
-            "step_std": step_std,                         # Variability of that movement.
-            "B": int(X.size(0)),                          # Number of sequences examined.
-            "T": int(X.size(1)),                          # Sequence length per sample (as provided).
-        })
+    # ——— 4) Optional step statistics along T when sequences are provided ———
+    if detail and X.ndim >= 2 and T > 1:
+        # Wrapped seat‑to‑seat distance captures local “bumpiness” along the sequence dimension.
+        d = wrapped_distance(X[:, 1:], X[:, :-1], delta)  # same shape as X[:, 1:]
+        step_mean = float(d.mean().item())
+        step_std = float(d.std(unbiased=False).item() if d.numel() > 1 else 0.0)
+        report.update({"step_mean": step_mean, "step_std": step_std, "B": B, "T": T})
 
-    return report                                        # One small dict to judge coherence at a glance.
+    return report

@@ -25,8 +25,8 @@ except Exception:
     from http.server import HTTPServer as _HTTPServer
 
 from urllib.parse import urlparse                # ✴ route parsing
-import torch                                     # ✴ tensors for input ids
 import traceback                                 # ✴ pretty errors for logs
+import torch                                     # ✴ tensors for input ids
 
 from . import __version__                        # ✴ project version string
 from .runtime import Engine                      # ✴ orchestration spine
@@ -70,7 +70,7 @@ def _engine() -> Engine:
 class Handler(BaseHTTPRequestHandler):
     # — Low‑level I/O helpers —
 
-    def _set_cors(self):
+    def _set_cors(self) -> None:
         # Permissive CORS for quick experiments (can be tightened if needed).
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -103,13 +103,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # — HTTP verbs —
 
-    def do_OPTIONS(self):
+    def do_OPTIONS(self) -> None:
         # CORS preflight
         self.send_response(204)
         self._set_cors()
         self.end_headers()
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         try:
             path = urlparse(self.path).path
             if path == "/health":
@@ -127,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("GET error: %s\n%s", repr(e), traceback.format_exc())
             return self._send_error(500, code="internal_error", message="unhandled GET exception")
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         try:
             path = urlparse(self.path).path
             data = self._read_json()
@@ -153,8 +153,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_infer(self, data: dict):
         # 1) Clean + validate request
-        req = coerce_infer_request(data)
-        err = validate_infer_request(req)
+        req = coerce_infer_request(data)          # tolerant shaping → InferRequest‑like obj
+        err = validate_infer_request(req)         # returns ErrorResponse or None
         if err is not None:
             return self._send(400, err)
 
@@ -184,17 +184,37 @@ class Handler(BaseHTTPRequestHandler):
         try:
             req = SteerRequest(**data)
         except TypeError:
-            return self._send_error(400, code="bad_request", message="expected {'prompt': str, 'modality': 'language'|...}")
+            return self._send_error(400, code="bad_request",
+                                    message="expected {'prompt': str, 'modality': 'language'|...}")
         if not req.prompt:
             return self._send_error(400, code="bad_request", message="missing 'prompt'")
 
         # 2) Ensure engine/model exist; Engine.steer will lazy‑train if needed
         eng = _engine()
 
-        # 3) We call Engine.steer() for simplicity; adapters may internally apply β/γ/⛔
-        #    If you need the explicit control params, replicate the controller mapping here.
-        output = eng.steer(prompt=req.prompt, modality=req.modality)
-        resp = SteerResponse(output=output, params=None)
+        # 3) Return adapter output; also expose the mapped control (β,γ,⛔) we applied
+        #    We mirror Engine.steer’s mapping so client UIs can show gauges.
+        try:
+            from .experience.steering import SteeringController
+            from .experience.adapters.base import AdapterRegistry
+            if eng.model is None:
+                _ = eng.infer(x=None)  # lazy materialize/train
+            ctrl = SteeringController.load_default(eng.cfg.delta)
+            v = ctrl(req.prompt)
+            params = SteeringController.to_params(v)  # {'beta','gamma','clamp','style'}
+            runner = AdapterRegistry.get(req.modality)()
+            output = runner(eng.model, req.prompt, v)
+            # Prepare a minimal, JSON‑friendly params view
+            pview = {"beta": float(params["beta"]),
+                     "gamma": float(params["gamma"]),
+                     "clamp": float(params["clamp"])}
+            resp = SteerResponse(output=output, params=pview)
+        except KeyError as e:
+            return self._send_error(400, code="bad_modality",
+                                    message=f"unknown modality: {req.modality!r}")
+        except Exception as e:
+            self.log_message("steer error: %s\n%s", repr(e), traceback.format_exc())
+            return self._send_error(500, code="internal_error", message="steer failed")
         return self._send(200, resp)
 
     def _handle_train(self, data: dict):
@@ -205,8 +225,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(400, code="bad_request", message="expected {'steps': int}")
 
         eng = _engine()
-        # Run a short training loop; Engine.fit() ignores 'steps', so we call train_loop via config override.
-        # To respect the requested steps, temporarily shadow cfg.steps.
+        # Run a short training loop; Engine.fit() uses cfg.steps, so we respect the
+        # requested steps by temporarily shadowing cfg.steps for this call.
         steps_orig = eng.cfg.steps
         try:
             eng.cfg.steps = int(max(1, req.steps))
@@ -221,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
 # CLI entry‑point
 # ————————————————————————————————————————————————
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(description="ElementFold HTTP server")
     p.add_argument("--host", type=str, default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     p.add_argument("--port", type=int, default=8080, help="TCP port (default: 8080)")
@@ -235,4 +255,3 @@ def main():
         pass
     finally:
         srv.server_close()
-

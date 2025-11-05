@@ -1,107 +1,185 @@
 # ElementFold · infer.py
-# Inference is the calm twin of training: we take a model and an optional token batch,
-# run a forward pass, and turn logits into tokens. The ledger X comes along for telemetry.
-# This file keeps things simple but robust:
-#   • Auto‑select device and eval/inference mode.
+# ──────────────────────────────────────────────────────────────────────────────
+# Inference is the calm twin of training: we take a model and (optionally) a token
+# batch, run a forward pass, and turn logits into tokens. The ledger X comes along
+# for telemetry. This file keeps things simple but robust:
+#   • Auto‑select device + eval/inference mode.
 #   • Greedy decoding by default (argmax).
-#   • Optional temperature / top‑k / top‑p sampling if you want stochastic outputs.
+#   • Optional temperature / top‑k / top‑p sampling for stochastic outputs.
+#
+# Notation (unicode used sparingly for clarity):
+#   • β — “exposure” (lives inside the model; not touched here),
+#   • γ — “damping”   (ditto),
+#   • ⛔ — clamp       (ditto).
+#
+# We only *decode* here (logits → tokens); controlling β/γ/⛔ happens elsewhere.
 
-import torch  # Tensors and inference context
+from __future__ import annotations
+from typing import Optional, Dict, Any, Tuple
+
+import torch
+
+
+# ————————————————————————————————————————————————————————————————
+# Sampling utilities
+# ————————————————————————————————————————————————————————————————
+
+def _apply_topk(logits: torch.Tensor, k: Optional[int]) -> torch.Tensor:
+    """
+    Keep the top‑k logits per position, set the rest to −∞ (so softmax drops them).
+    Shape: logits ∈ ℝ^{B×T×V}  →  returns a new tensor with same shape.
+    """
+    if k is None or k <= 0:
+        return logits
+    V = logits.size(-1)
+    k = int(k)
+    if k >= V:
+        return logits  # nothing to do
+    topk_vals, topk_idx = torch.topk(logits, k, dim=-1)
+    pruned = torch.full_like(logits, float("-inf"))
+    return pruned.scatter(-1, topk_idx, topk_vals)
+
+
+def _apply_topp(logits: torch.Tensor, p: Optional[float]) -> torch.Tensor:
+    """
+    Nucleus (top‑p) filtering: keep the smallest prefix of tokens whose
+    probability mass ≥ p at each (B,T) position; drop the rest (−∞).
+    """
+    if p is None or not (0.0 < float(p) < 1.0):
+        return logits
+
+    # Sort by logit for stable nucleus selection.
+    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)  # (B,T,V)
+    probs = torch.softmax(sorted_logits, dim=-1)
+    cumprobs = probs.cumsum(dim=-1)
+
+    # Mask everything AFTER the cutoff. Ensure the best token always survives.
+    cutoff = cumprobs > float(p)
+    cutoff[..., 0] = False
+
+    kept = sorted_logits.masked_fill(cutoff, float("-inf"))
+    # Scatter back to original token order.
+    out = torch.full_like(logits, float("-inf"))
+    return out.scatter(-1, sorted_idx, kept)
 
 
 def _sample_from_logits(
     logits: torch.Tensor,           # (B,T,V) unnormalized scores
     temperature: float = 1.0,       # >0; lower → sharper, higher → flatter
-    top_k: int | None = None,       # keep K most likely tokens per position
-    top_p: float | None = None,     # nucleus sampling: keep smallest set with cumprob ≥ p
+    top_k: Optional[int] = None,    # keep K most likely tokens per position
+    top_p: Optional[float] = None,  # nucleus sampling: keep minimal set with cumprob ≥ p
 ) -> torch.Tensor:
     """
-    Turn logits into token ids using temperature + (optional) top‑k/top‑p.
-    We operate position‑wise; this model predicts all positions in one pass.
+    Turn logits into token ids using temperature + optional top‑k/top‑p filters.
+    We operate position‑wise; the model predicts all positions in one pass.
     """
-    # 1) Optional temperature scaling (never divide by 0)
+    # 0) Deterministic fallback: temperature ≤ 0 behaves like greedy (common UI edge case).
     if temperature <= 0:
-        temperature = 1e-8  # guard against zero/negative values
-    logits = logits / float(temperature)  # sharper or flatter distribution
+        return logits.argmax(dim=-1)
 
-    # 2) Optional top‑k filter: zero out everything except the top k per position
-    if top_k is not None and top_k > 0:
-        k = min(int(top_k), logits.size(-1))                     # clamp K to vocab size
-        topk_vals, topk_idx = torch.topk(logits, k, dim=-1)      # top‑k per (B,T)
-        mask = torch.full_like(logits, float("-inf"))            # start with −∞ everywhere
-        logits = mask.scatter(-1, topk_idx, topk_vals)           # place top‑k values back
+    # 1) Temperature scaling (never divide by 0).
+    logits = logits / float(temperature)
 
-    # 3) Optional top‑p (nucleus): keep the smallest prefix reaching probability mass ≥ p
-    if top_p is not None and 0.0 < float(top_p) < 1.0:
-        # Sort tokens by logit descending to build a cumulative prob tail
-        sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-        probs = torch.softmax(sorted_logits, dim=-1)                      # convert to probs
-        cumprobs = probs.cumsum(dim=-1)                                   # cumulative probability
-        # Build a mask of tokens to drop (everything after the cutoff)
-        cutoff = (cumprobs > float(top_p))                                # True where past nucleus
-        # Ensure at least one token is kept at each position
-        cutoff[..., 0] = False
-        # Replace dropped token logits with −∞; then scatter back to original order
-        sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
-        logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, sorted_logits)
+    # 2) Optional pruning. Order: top‑k then top‑p (common practice; either order is defensible).
+    logits = _apply_topk(logits, top_k)
+    logits = _apply_topp(logits, top_p)
 
-    # 4) Sample from the (filtered) categorical distribution
-    probs = torch.softmax(logits, dim=-1)                       # proper distribution over tokens
-    # torch.multinomial needs 2‑D, so we flatten (B*T, V) and then unflatten back
+    # 3) Sample from categorical distribution at each (B,T) position.
+    probs = torch.softmax(logits, dim=-1)                      # (B,T,V)
     B, T, V = probs.shape
-    flat = probs.reshape(B * T, V)
-    idx = torch.multinomial(flat, num_samples=1)                # draw 1 token per position
-    return idx.view(B, T)                                       # (B,T) token ids
+    flat = probs.reshape(B * T, V)                             # (B·T, V)
+
+    # Guard against numerical edge cases (shouldn’t trigger with our filters):
+    # If any row sums to ~0 due to all −∞, softmax would be NaNs. As a belt‑and‑suspenders,
+    # replace NaNs by uniform mass over V (rare; mainly defensive during bring‑up).
+    nan_rows = torch.isnan(flat).any(dim=1)
+    if nan_rows.any():
+        flat[nan_rows] = 1.0 / V
+
+    idx = torch.multinomial(flat, num_samples=1)               # (B·T,1)
+    return idx.view(B, T)                                      # (B,T) int64
+
+
+# ————————————————————————————————————————————————————————————————
+# Main inference entry
+# ————————————————————————————————————————————————————————————————
+
+def _model_device(model) -> torch.device:
+    """Best‑effort device discovery even for exotic models."""
+    try:
+        return next(model.parameters()).device
+    except Exception:
+        return torch.device("cpu")
 
 
 def infer_loop(
     model,
-    x: torch.Tensor | None = None,      # optional input tokens: (B,T) int64
+    x: Optional[torch.Tensor] = None,   # optional input tokens: (B,T) int64
+    *,
     strategy: str = "greedy",           # 'greedy' or 'sample'
     temperature: float = 1.0,           # used when strategy='sample'
-    top_k: int | None = None,           # used when strategy='sample'
-    top_p: float | None = None,         # used when strategy='sample'
-):
+    top_k: Optional[int] = None,        # used when strategy='sample'
+    top_p: Optional[float] = None,      # used when strategy='sample'
+) -> Dict[str, Any]:
     """
     Run a forward pass and decode tokens with the chosen strategy.
 
-    Returns:
-        {
-          'tokens': (B,T) int64 decoded tokens,
-          'ledger': (B,T) float32 ledger coordinates X
-        }
+    Inputs
+    ------
+    model:
+        ElementFold model whose forward returns (logits, X), where:
+          • logits ∈ ℝ^{B×T×V} (unnormalized scores over vocab),
+          • X      ∈ ℝ^{B×T}   (ledger: latent coordinate along rungs).
+    x:
+        Optional input tokens (B,T), dtype long. If None, we synthesize a random
+        (1,T) batch using model.vocab and model.seq_len (handy for demos).
+    strategy:
+        'greedy' (argmax; deterministic) or 'sample' (stochastic).
+    temperature, top_k, top_p:
+        Sampling knobs when strategy='sample' (ignored for greedy).
+
+    Returns
+    -------
+    dict with:
+      • 'tokens' : (B,T) int64 — decoded tokens,
+      • 'ledger' : (B,T) float — ledger X for telemetry/visualization.
     """
-    if model is None:                    # If no model is provided, we cannot infer.
-        return None                      # Early exit is clearer than raising here.
+    if model is None:
+        raise ValueError("infer_loop: model is None")
 
-    # 1) Pick device by asking any parameter where it lives; default to CPU otherwise.
-    device = next(model.parameters()).device if hasattr(model, "parameters") else torch.device("cpu")
+    device = _model_device(model)
 
-    # 2) Prepare input tokens. If caller didn't provide x, we synthesize a random batch of size 1.
+    # Prepare input: ensure (B,T) on the correct device.
     if x is None:
-        x = torch.randint(0, model.vocab, (1, model.seq_len), device=device)  # (1,T) random ids
+        # Rely on model attributes (ElementFold Model exposes .vocab and .seq_len).
+        vocab = getattr(model, "vocab", None)
+        seq_len = getattr(model, "seq_len", None)
+        if vocab is None or seq_len is None:
+            raise AttributeError("model must expose .vocab and .seq_len when x is None")
+        x = torch.randint(0, int(vocab), (1, int(seq_len)), device=device)
     else:
         if x.dim() == 1:
-            x = x.unsqueeze(0)                          # Guarantee a batch dimension → (1,T)
-        x = x.to(device)                                 # Move tokens to the same device as the model
+            x = x.unsqueeze(0)  # → (1,T)
+        x = x.to(device)
 
-    # 3) Evaluation mode for layers like dropout; inference_mode disables grad and is fast/safe.
-    was_training = getattr(model, "training", False)     # Remember state to restore after
-    model.eval()                                         # Set eval mode
+    was_training = getattr(model, "training", False)
+    model.eval()
     with torch.inference_mode():
-        logits, X = model(x)                             # Forward once: (B,T,V) and (B,T)
+        logits, X = model(x)  # (B,T,V), (B,T)
 
-        # 4) Decode tokens according to the chosen strategy
-        if strategy == "greedy":                         # Deterministic: pick the largest logit at each position
-            y = logits.argmax(dim=-1)                   # (B,T)
-        elif strategy == "sample":                       # Stochastic: sample with temperature and optional top‑k/top‑p
-            y = _sample_from_logits(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+        if strategy == "greedy":
+            y = logits.argmax(dim=-1)  # (B,T)
+        elif strategy == "sample":
+            y = _sample_from_logits(
+                logits,
+                temperature=float(temperature),
+                top_k=(int(top_k) if top_k is not None else None),
+                top_p=(float(top_p) if top_p is not None else None),
+            )
         else:
-            raise ValueError(f"unknown strategy: {strategy!r}")  # Guard against typos
+            raise ValueError(f"unknown strategy: {strategy!r}; use 'greedy' or 'sample'")
 
-    # 5) Restore training mode if we changed it (polite behavior in larger programs)
     if was_training:
         model.train()
 
-    # 6) Return both the discrete tokens and the continuous ledger coordinates
     return {"tokens": y, "ledger": X}

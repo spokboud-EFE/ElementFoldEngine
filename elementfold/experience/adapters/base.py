@@ -1,112 +1,165 @@
 # ElementFold · experience/adapters/base.py
-# Adapters are small “bridges” from a model to a user modality (language, vision, audio, …).
-# This registry:
-#   • register(name, factory)   — add an adapter factory under a string key,
-#   • get(name)                 — fetch the factory (raises with a helpful message if missing),
-#   • names()                   — list all registered names (sorted for stable UX),
-#   • ensure(name, default)     — get existing or set a default factory,
-#   • has(name) / __contains__  — quick membership checks,
-#   • decorator form            — @AdapterRegistry.register_fn("name") for concise definitions.
-# We keep the contract used elsewhere in the project:
-#     factory = AdapterRegistry.get("language")
-#     runner  = factory()                     # factory produces a callable
-#     out     = runner(model, prompt, style)  # runner executes the modality
+# ──────────────────────────────────────────────────────────────────────────────
+# Adapters are small “bridges” from a model to a user modality (language, audio,
+# photonics, …). The registry below maps a *name* → *factory*, where a factory
+# is a zero‑arg callable returning a *runner*. A runner has the signature:
+#
+#     runner(model, prompt, style) -> Any
+#
+# Public API (tiny, stdlib‑only):
+#   • AdapterRegistry.register(name, factory, *, overwrite=True)
+#   • AdapterRegistry.get(name)          → factory (KeyError on miss, with hints)
+#   • AdapterRegistry.ensure(name, default) → factory (install default if absent)
+#   • AdapterRegistry.names()            → sorted tuple of names
+#   • AdapterRegistry.has(name) / "name" in AdapterRegistry
+#   • AdapterRegistry.register_fn("name")  decorator form
+#   • AdapterRegistry.unregister(name)   → remove a factory (testing/dev only)
+#   • AdapterRegistry.clear()            → drop all factories (testing/dev only)
+#
+# Design notes:
+#   • Names are normalized to lowercase (ASCII) for stable CLI UX.
+#   • Errors include close‑match suggestions (handy at the REPL).
+#   • Thread‑safe writes via a simple lock; reads are uncontended.
+#   • Backward‑compatible: existing calls keep working as‑is.
+#
+from __future__ import annotations
 
-from __future__ import annotations                   # Allow forward annotations on older Python
-from typing import Callable, Dict, Tuple             # Light typing for clarity
-import threading                                     # Simple lock for thread‑safe updates
+from typing import Callable, Dict, Tuple
+import threading
+import warnings
+import difflib
+
+
+def _norm(name: str) -> str:
+    """Normalize external names to a stable, case‑insensitive key."""
+    return str(name).strip().lower()
 
 
 class AdapterRegistry:
     """
-    A tiny, thread‑safe mapping from modality name → adapter factory.
+    A tiny, thread‑safe mapping from adapter name → adapter factory.
 
     Definitions:
-      • name:    str key like "language", "vision", "audio".
-      • factory: zero‑arg callable that returns a *runner* callable.
-                 The runner has signature runner(model, prompt, style) → Any.
-
-    We store factories (not runners) so that adapters can capture configuration
-    each time they’re constructed (e.g., lazy imports, device picks, etc.).
+      • name:    string key like "language", "resonator", "interferometer".
+      • factory: zero‑arg callable returning a *runner* callable.
+                 Runner signature: runner(model, prompt, style) -> Any
     """
 
-    _reg: Dict[str, Callable[[], Callable]] = {}      # Internal map: name → factory (zero‑arg callable)
-    _lock = threading.Lock()                          # Protect concurrent register/ensure calls
+    _reg: Dict[str, Callable[[], Callable]] = {}
+    _lock = threading.Lock()
 
-    # ————————————————————————————————————————————————
+    # ────────────────────────────────────────────────────────────────────────
     # Core operations
-    # ————————————————————————————————————————————————
+    # ────────────────────────────────────────────────────────────────────────
 
     @classmethod
-    def register(cls, name: str, factory: Callable[[], Callable]) -> None:
+    def register(
+        cls,
+        name: str,
+        factory: Callable[[], Callable],
+        *,
+        overwrite: bool = True,
+    ) -> None:
         """
         Register an adapter factory under `name`.
-        We validate that the factory is callable so errors are caught early.
+
+        Args:
+            name:     registry key (case‑insensitive; stored lowercase).
+            factory:  zero‑arg callable producing a runner.
+            overwrite: if False and name exists, raise KeyError; otherwise replace
+                       and emit a gentle warning so accidental shadowing is visible.
+
+        Raises:
+            TypeError: if `factory` is not callable.
+            KeyError:  if `overwrite=False` and `name` already exists.
         """
-        key = str(name)                                # Normalize key to string
-        if not callable(factory):                      # Guard: enforce callable
-            raise TypeError(f"adapter factory for {key!r} must be callable, got {type(factory).__name__}")
-        with cls._lock:                                # Thread‑safe write
-            cls._reg[key] = factory                    # Install/replace the factory
+        if not callable(factory):
+            raise TypeError(f"adapter factory for {name!r} must be callable, got {type(factory).__name__}")
+        key = _norm(name)
+        with cls._lock:
+            if key in cls._reg and not overwrite:
+                raise KeyError(f"adapter:{key} already registered; set overwrite=True to replace")
+            if key in cls._reg and overwrite:
+                prev = cls._reg[key]
+                warnings.warn(
+                    f"Adapter '{key}' overwritten (was {getattr(prev, '__name__', type(prev).__name__)}).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            cls._reg[key] = factory
 
     @classmethod
     def get(cls, name: str) -> Callable[[], Callable]:
         """
-        Fetch the adapter factory for `name`. Raises KeyError if missing,
-        and includes a helpful list of available names.
+        Fetch the adapter factory for `name`.
+
+        Returns:
+            The registered zero‑arg factory.
+
+        Raises:
+            KeyError with a friendly message and close‑match suggestions.
         """
-        key = str(name)                                # Normalize lookup key
+        key = _norm(name)
         try:
-            return cls._reg[key]                       # Fast path: found
+            return cls._reg[key]
         except KeyError:
-            available = ", ".join(sorted(cls._reg.keys())) or "∅ (none registered)"
-            raise KeyError(f"adapter:{key} not found; available = [{available}]") from None
+            avail = sorted(cls._reg.keys())
+            hint = ""
+            if avail:
+                # Suggest up to 3 close matches (threshold tuned for short names)
+                matches = difflib.get_close_matches(key, avail, n=3, cutoff=0.6)
+                if matches:
+                    hint = f"  did you mean: {', '.join(matches)}?"
+            available = ", ".join(avail) if avail else "∅ (none registered)"
+            raise KeyError(f"adapter:{key} not found; available = [{available}].{hint}") from None
 
     @classmethod
     def ensure(cls, name: str, default: Callable[[], Callable]) -> Callable[[], Callable]:
         """
         Get existing factory for `name`, or register `default` if absent.
-        Useful for optional adapters that should have a fallback.
-        """
-        if not callable(default):                      # Validate fallback
-            raise TypeError(f"default factory for {name!r} must be callable, got {type(default).__name__}")
-        key = str(name)
-        with cls._lock:                                # Thread‑safe read‑then‑write
-            return cls._reg.setdefault(key, default)   # Return existing or install default
 
-    # ————————————————————————————————————————————————
+        Returns:
+            The existing or newly registered factory.
+
+        Raises:
+            TypeError if `default` is not callable.
+        """
+        if not callable(default):
+            raise TypeError(f"default factory for {name!r} must be callable, got {type(default).__name__}")
+        key = _norm(name)
+        with cls._lock:
+            if key not in cls._reg:
+                cls._reg[key] = default
+            return cls._reg[key]
+
+    # ────────────────────────────────────────────────────────────────────────
     # Convenience and UX
-    # ————————————————————————————————————————————————
+    # ────────────────────────────────────────────────────────────────────────
 
     @classmethod
     def names(cls) -> Tuple[str, ...]:
-        """
-        Return a sorted, immutable tuple of registered adapter names.
-        Stable order makes CLI and logs deterministic.
-        """
+        """Return a sorted, immutable tuple of registered adapter names."""
         return tuple(sorted(cls._reg.keys()))
 
     @classmethod
     def has(cls, name: str) -> bool:
-        """
-        Quick membership test (same as `name in AdapterRegistry`).
-        """
-        return str(name) in cls._reg
+        """Quick membership test (same as `name in AdapterRegistry`)."""
+        return _norm(name) in cls._reg
 
-    def __contains__(self, name: str) -> bool:         # Allows:  "language" in AdapterRegistry
+    def __contains__(self, name: str) -> bool:  # Allows: "language" in AdapterRegistry
         return self.has(name)
 
-    def __len__(self) -> int:                          # How many adapters are registered?
+    def __len__(self) -> int:                   # How many adapters are registered?
         return len(self._reg)
 
-    # ————————————————————————————————————————————————
+    # ────────────────────────────────────────────────────────────────────────
     # Decorator form for concise registration
-    # ————————————————————————————————————————————————
+    # ────────────────────────────────────────────────────────────────────────
 
     @classmethod
     def register_fn(cls, name: str) -> Callable[[Callable[[], Callable]], Callable[[], Callable]]:
         """
-        Decorator to register a factory:
+        Decorator to register a zero‑arg *factory* under `name`.
 
             @AdapterRegistry.register_fn("language")
             def make_language_adapter():
@@ -114,9 +167,27 @@ class AdapterRegistry:
                     ...
                 return run
 
-        Returns the original factory unchanged for normal Python semantics.
+        Returns:
+            The original factory unchanged (normal Python semantics).
         """
         def _decorator(factory: Callable[[], Callable]) -> Callable[[], Callable]:
-            cls.register(name, factory)                # Reuse validation and locking
+            cls.register(name, factory)  # uses normalization + locking
             return factory
         return _decorator
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Testing / maintenance helpers (no external callers in core flow)
+    # ────────────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def unregister(cls, name: str) -> None:
+        """Remove a factory by name. Intended for tests or dynamic reload scenarios."""
+        key = _norm(name)
+        with cls._lock:
+            cls._reg.pop(key, None)
+
+    @classmethod
+    def clear(cls) -> None:
+        """Drop all registered adapters. Intended for tests or process teardown."""
+        with cls._lock:
+            cls._reg.clear()
