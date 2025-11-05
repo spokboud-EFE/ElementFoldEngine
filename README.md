@@ -38,7 +38,7 @@ python -m elementfold --help
 ## In Studio:
 #> /mod resonator
 #> help
-#> init δ=0.5
+#> iδ=0.5nit 
 #> hold
 #> tick 5
 #> step up 2
