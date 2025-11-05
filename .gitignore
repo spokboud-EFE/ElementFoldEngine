@@ -4,3 +4,5 @@ conda_env.yml
 cusparselt-local-tegra-repo-ubuntu2204-0.7.1_1.0-1_arm64.deb
 torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
 *.zip
+*.DS_Store*
+
