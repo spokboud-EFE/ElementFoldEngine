@@ -128,4 +128,3 @@ if __name__ == "__main__":
     print("vocab:", tok.vocab, "max_len:", tok.max_len)
     print("ids (head):", ids[:16], "… len=", len(ids))
     print("round‑trip (lossless? ", tok.is_lossless(), "):", back[:48], "…")
-vesqm

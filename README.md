@@ -15,17 +15,17 @@ python -m elementfold --help
 #PY
 
 
-#python - <<'PY'
-#from elementfold.rung_controller import RungController, RungIntent
-#
-#r = RungController(delta=0.5, intent=RungIntent.SEEK, k_target=3)
-#
-#print("Initial:", r.status())
-#for step in range(12):
-#    tele = {"κ":0.3, "p½":0.45, "x_mean": step*0.25}
-#    ctrl = r.update(tele, {"beta":1.0,"gamma":0.5,"clamp":5.0})
-#    print(f"step {step:02d} | ctrl={ctrl} | state={r.status()['phase']}")
-#PY
+python - <<'PY'
+from elementfold.rung_controller import RungController, RungIntent
+
+r = RungController(delta=0.5, intent=RungIntent.SEEK, k_target=3)
+
+print("Initial:", r.status())
+for step in range(12):
+   tele = {"κ":0.3, "p½":0.45, "x_mean": step*0.25}
+   ctrl = r.update(tele, {"beta":1.0,"gamma":0.5,"clamp":5.0})
+   print(f"step {step:02d} | ctrl={ctrl} | state={r.status()['phase']}")
+PY
 
 
 ## Studio
@@ -39,13 +39,13 @@ python -m elementfold --help
 #> step up 2
 #> status
 
-#from elementfold.experience.adapters.base import AdapterRegistry
-#run = AdapterRegistry.get("resonator")()
-#print(run(None, "init δ=0.5"))
-#print(run(None, "hold"))
-#print(run(None, "tick 6"))
-#print(run(None, "step up 1"))
-#print(run(None, "status"))
+# from elementfold.experience.adapters.base import AdapterRegistry
+# run = AdapterRegistry.get("resonator")()
+# print(run(None, "init δ=0.5"))
+# print(run(None, "hold"))
+# print(run(None, "tick 6"))
+# print(run(None, "step up 1"))
+# print(run(None, "status"))
 
 #(inside studio)
 #help                 — show commands
