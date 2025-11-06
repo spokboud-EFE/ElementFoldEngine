@@ -4,6 +4,7 @@
    • spacious layout with readable font sizes,
    • logical visual grouping,
    • no dependencies (pure CSS).
+   • small additions: adapter quick-controls, driver line, badges, responsive cols
    ────────────────────────────────────────────────────────────────────────── */
 
 :root {
@@ -35,9 +36,17 @@ header { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
 #status { color: var(--muted); }
 
 .row { margin: 12px 0; display: block; }
-.cols { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-.col label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 
+/* Responsive columns:
+   - auto-fit as many 180px cols as will fit
+   - falls back to 1–2 cols on narrow screens */
+.cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.col label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 
 textarea {
@@ -62,6 +71,25 @@ select, input[type="number"], button {
 button { cursor: pointer; }
 button:hover { border-color: var(--accent); }
 
+/* Accessible focus ring */
+button:focus-visible,
+select:focus-visible,
+input[type="number"]:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Code look for inline DSL hints */
+code {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+}
+
 pre {
   padding: 8px;
   border: 1px solid var(--border);
@@ -73,6 +101,65 @@ pre {
 }
 
 .mono { font-family: var(--mono); }
-
 .hint { color: var(--muted); font-size: 12px; }
 audio { width: 100%; }
+
+/* ──────────────────────────────────────────────────────────────────────────
+   New: adapter quick-controls + driver inline controls
+   ────────────────────────────────────────────────────────────────────────── */
+
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.spacer { display: inline-block; width: 8px; }
+
+/* Light status line under driver controls */
+#adapterStatus {
+  margin-top: 6px;
+  min-height: 1.2em;
+  color: var(--muted);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   New: prediction badges (ℱ, z, A≈e^(−2ℱ), …)
+   ────────────────────────────────────────────────────────────────────────── */
+
+#predBadges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 30px;  /* keeps row from collapsing when empty */
+  align-items: center;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(0,0,0,0.08);
+  background: rgba(10, 170, 119, 0.08);     /* accent tint */
+  border-color: rgba(10, 170, 119, 0.25);
+  font-size: 12px;
+  font-family: var(--mono);
+  line-height: 1.6;
+}
+
+.badge--muted {
+  background: rgba(0, 0, 0, 0.04);
+  border-color: rgba(0, 0, 0, 0.12);
+}
+
+.badge--warn {
+  background: rgba(255, 153, 0, 0.10);
+  border-color: rgba(255, 153, 0, 0.35);
+}

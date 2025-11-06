@@ -6,8 +6,8 @@
 │ - Goal: be *readable at a glance* with clear sections and minimal controls.  │
 │ - Talks to server.py endpoints:                                              │
 │     GET  /health                                                             │
-│     POST /infer   {strategy, temperature, top_k, top_p, text|tokens}         │
-│     POST /steer   {prompt, modality}                                         │
+│     POST /infer  {strategy, temperature, top_k, top_p, text|tokens}          │
+│     POST /steer  {prompt, modality}                                          │
 │ - Works best when served by server.py (same origin → no CORS fuss).          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 -->
@@ -31,7 +31,7 @@
   <hr />
 
   <!-- ───────────────────────────────────────────────────────────────────── -->
-  <!-- Inference Panel (greedy / sampling)                                   -->
+  <!-- Inference Panel (greedy / sampling)                                  -->
   <!-- ───────────────────────────────────────────────────────────────────── -->
   <section>
     <h2>➊ Inference</h2>
@@ -84,7 +84,7 @@
   <hr />
 
   <!-- ───────────────────────────────────────────────────────────────────── -->
-  <!-- Steering Panel (language / audio / multimodal)                        -->
+  <!-- Steering Panel (language / audio / multimodal / resonator)           -->
   <!-- ───────────────────────────────────────────────────────────────────── -->
   <section>
     <h2>➋ Steering (Adapters)</h2>
@@ -97,12 +97,15 @@
           <option value="language">language</option>
           <option value="audio">audio</option>
           <option value="multimodal">multimodal</option>
+          <option value="resonator">resonator</option>
+          <option value="interferometer">interferometer</option>
         </select>
       </div>
       <div class="col">
         <label>Hint</label>
         <div class="hint">
-          multimodal accepts: <code>text: hello | image: /path/on/server.png | audio: /path/on/server.wav</code>
+          <div>• <b>resonator/interferometer</b>: use the quick controls below or type commands (e.g., <code>tick 5</code>, <code>hold</code>, <code>step up 1</code>).</div>
+          <div>• <b>multimodal</b> mini‑DSL: <code>text: hello | image: /path/on/server.png | audio: /path/on/server.wav</code></div>
         </div>
       </div>
     </div>
@@ -110,12 +113,47 @@
     <!-- Prompt -->
     <div class="row">
       <label for="steerPrompt">Prompt</label>
-      <textarea id="steerPrompt" placeholder="Type text; for multimodal you can use the mini‑DSL (see hint above)."></textarea>
+      <textarea id="steerPrompt" placeholder="Type text; for resonator you can also type 'status', 'tick 3', 'seek k=7', etc.  Ctrl+Enter to send."></textarea>
+    </div>
+
+    <!-- Adapter quick controls (optional sugar; same as sending text commands) -->
+    <div class="row cols">
+      <div class="col">
+        <label>Adapter</label>
+        <div class="buttons">
+          <button id="btnStatus">status</button>
+          <button id="btnTick1">tick ×1</button>
+          <button id="btnTick5">tick ×5</button>
+          <button id="btnHold">hold</button>
+          <button id="btnStepUp">step ↑</button>
+          <button id="btnStepDown">step ↓</button>
+        </div>
+      </div>
+      <div class="col">
+        <label>Driver</label>
+        <div class="inline">
+          <select id="driverSelect" title="resonator driver">
+            <option value="sim">sim</option>
+            <option value="null">null</option>
+          </select>
+          <span class="spacer"></span>
+          <label for="deltaValue">δ⋆</label>
+          <input type="number" id="deltaValue" step="0.01" value="0.50" />
+          <button id="btnDeltaSet">set</button>
+        </div>
+        <div id="adapterStatus" class="hint mono"></div>
+      </div>
     </div>
 
     <!-- Action -->
     <div class="row">
       <button id="btnSteer">POST /steer</button>
+    </div>
+
+    <!-- Predictions (if present in adapter output; populated by app.js) -->
+    <div class="row">
+      <label>Predictions</label>
+      <div id="predBadges"></div>
     </div>
 
     <!-- Output -->

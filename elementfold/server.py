@@ -12,6 +12,7 @@
 #   3) Robust JSON: we validate/clean incoming payloads and return structured ErrorResponse.
 #   4) CORS: permissive defaults for quick UX experiments from a browser (OPTIONS supported).
 #   5) No external deps: stdlib http.server + our tiny server_api helpers.
+#   6) Adapters are *pre‑registered here* so /steer works standalone (Studio not required).
 
 from __future__ import annotations
 
@@ -26,11 +27,20 @@ except Exception:
 
 from urllib.parse import urlparse                # ✴ route parsing
 import traceback                                 # ✴ pretty errors for logs
+import difflib                                   # ✴ friendly suggestions on modality mistypes
 import torch                                     # ✴ tensors for input ids
 
 from . import __version__                        # ✴ project version string
 from .runtime import Engine                      # ✴ orchestration spine
 from .tokenizer import SimpleTokenizer           # ✴ tiny byte tokenizer
+
+# Force adapter registration so /steer works even without Studio imports.
+# (Their decorators register factories at import time.)
+# If you add a new adapter file, import it here.
+from .experience.adapters import language as _adp_lang    # noqa: F401
+from .experience.adapters import audio as _adp_audio      # noqa: F401
+from .experience.adapters import multimodal as _adp_mm    # noqa: F401
+from .experience.adapters import resonator as _adp_res    # noqa: F401
 
 # API schemas + JSON helpers
 from .server_api import (
@@ -46,6 +56,40 @@ from .server_api import (
     # packers
     pack_infer_response, pack_error,
 )
+
+# Registry for steering adapters (runners)
+from .experience.adapters.base import AdapterRegistry
+
+
+# ————————————————————————————————————————————————
+# Tiny helpers
+# ————————————————————————————————————————————————
+
+def _normalize_modality(name: str | None) -> str:
+    """Friendly normalization + a few aliases."""
+    if not name:
+        return "language"
+    key = str(name).strip().lower()
+    aliases = {
+        "text": "language",
+        "lang": "language",
+        "speech": "audio",
+        "sound": "audio",
+        "mm": "multimodal",
+        "photo": "multimodal",
+        "image": "multimodal",
+        "res": "resonator",
+        "interf": "interferometer",
+        "photonic": "interferometer",
+    }
+    return aliases.get(key, key)
+
+
+def _closest_modalities(key: str, n: int = 3) -> list[str]:
+    """Suggest close matches from the registry for a mistyped modality."""
+    names = list(AdapterRegistry.names())
+    return difflib.get_close_matches(key, names, n=n, cutoff=0.55)
+
 
 # ————————————————————————————————————————————————
 # Lazy Engine singleton (protected by a small lock)
@@ -189,29 +233,42 @@ class Handler(BaseHTTPRequestHandler):
         if not req.prompt:
             return self._send_error(400, code="bad_request", message="missing 'prompt'")
 
-        # 2) Ensure engine/model exist; Engine.steer will lazy‑train if needed
+        # Normalize + alias resolution for UX
+        modality = _normalize_modality(getattr(req, "modality", None))
+
+        # 2) Ensure engine/model exist; Engine.steer may lazy‑train if needed
         eng = _engine()
 
-        # 3) Return adapter output; also expose the mapped control (β,γ,⛔) we applied
-        #    We mirror Engine.steer’s mapping so client UIs can show gauges.
+        # 3) Return adapter output; also expose the mapped control (β,γ,⛔) we applied.
         try:
             from .experience.steering import SteeringController
-            from .experience.adapters.base import AdapterRegistry
             if eng.model is None:
                 _ = eng.infer(x=None)  # lazy materialize/train
             ctrl = SteeringController.load_default(eng.cfg.delta)
             v = ctrl(req.prompt)
             params = SteeringController.to_params(v)  # {'beta','gamma','clamp','style'}
-            runner = AdapterRegistry.get(req.modality)()
+
+            # Adapter runner (stateful across calls) — factory returns a callable
+            try:
+                factory = AdapterRegistry.get(modality)
+            except KeyError:
+                # Build a friendlier error with suggestions
+                suggestions = _closest_modalities(modality)
+                hint = f"did you mean: {', '.join(suggestions)}?" if suggestions else "no adapters registered"
+                return self._send_error(
+                    400, code="bad_modality",
+                    message=f"unknown modality: {modality!r}",
+                    details={"available": list(AdapterRegistry.names()), "hint": hint},
+                )
+            runner = factory()
             output = runner(eng.model, req.prompt, v)
+
             # Prepare a minimal, JSON‑friendly params view
             pview = {"beta": float(params["beta"]),
                      "gamma": float(params["gamma"]),
                      "clamp": float(params["clamp"])}
+
             resp = SteerResponse(output=output, params=pview)
-        except KeyError as e:
-            return self._send_error(400, code="bad_modality",
-                                    message=f"unknown modality: {req.modality!r}")
         except Exception as e:
             self.log_message("steer error: %s\n%s", repr(e), traceback.format_exc())
             return self._send_error(500, code="internal_error", message="steer failed")
