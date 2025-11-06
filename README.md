@@ -4,7 +4,7 @@
 
 **Proving that coherence itself can be engineered as the new foundation of intelligence and design.**
 
-EFE is publicly available exclusively for non-profit organizations. Reproductions for profit arent allowed without a custom commercial license.
+Publicly available exclusively for non-profit organizations. Reproductions for profit arent allowed without a custom commercial license.
 
 Discord Channel ---> [SRT DISCORD](https://discord.gg/nzyWctG2)
 
