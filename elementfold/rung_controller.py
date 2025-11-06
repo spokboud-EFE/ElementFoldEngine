@@ -18,6 +18,14 @@
 #   • A gentle FSM guides barrier crossing:
 #         LOCKED → MID (lean) → CROSSING (over the ridge) → CAPTURE (re‑lock).
 #
+# Silent relaxation awareness (diffusion/decay in small, safe doses)
+#   • If the runtime also reports relaxation signals — folds 𝔉 (or F), share rate η,
+#     letting‑go λ, smoothing D — we distill them into a calmness score ∈ [0,1].
+#     More calm ⇒ slightly less β, slightly higher γ, slightly softer ⛔.
+#   • During CROSSING/MID we trim the cross‑override weight a touch as calm ↑.
+#     During HOLD/CAPTURE we nudge the hold‑override weight a touch as calm ↑.
+#   • If none of these signals are present, behavior is identical to before.
+#
 # Implementation notes
 #   • Pure stdlib; no heavy deps. Designed to be easy to read & test.
 #   • Back‑compat: accepts step_up/step_down intents with a `steps=` kwarg.
@@ -58,37 +66,56 @@ class RungTuning:
       • Higher γ near the barrier discourages “teetering”.
       • Slight β boost when crossing encourages decisive movement.
       • Blends are small (≤ 0.5), because Supervisor stays in charge.
+
+    Relaxation‑aware micro‑modulation:
+      • calmness ∈ [0,1] softly reduces β, softly raises γ, softly lowers ⛔.
+      • Cross‑phase blend (MID/CROSSING) is trimmed a bit as calm ↑.
+      • Hold‑phase blend (LOCKED/CAPTURE) is nudged up a bit as calm ↑.
     """
     # Acceptance band half‑width; default ≈ δ⋆/6
     epsilon_scale: float = 1 / 6
 
     # State machine thresholds (fallbacks if tele['p_half'] unavailable)
     p_half_target: float = 0.55     # above 0.5 → very likely “over the ridge”
-    p_half_lock: float = 0.12       # well under this → “locked” on a rung
+    p_half_lock: float   = 0.12     # well under this → “locked” on a rung
 
     # Dwell (ticks) for decisions; short for training, can be longer in prod
-    dwell_mid: int = 3              # linger at MID a few ticks before crossing
-    dwell_lock: int = 3             # linger at CAPTURE before declaring lock
+    dwell_mid: int  = 3            # linger at MID a few ticks before crossing
+    dwell_lock: int = 3            # linger at CAPTURE before declaring lock
 
     # Override magnitudes (targets we blend toward)
-    beta_boost: float = 2.0         # nimble while crossing
-    beta_hold: float = 1.2          # modest β when holding
+    beta_boost: float    = 2.0      # nimble while crossing
+    beta_hold: float     = 1.2      # modest β when holding
     gamma_damp_lo: float = 0.05     # low damping while crossing
     gamma_damp_hi: float = 0.60     # higher damping when locking/capturing
-    clamp_safe: float = 5.0         # safe ⛔ during guidance
+    clamp_safe: float    = 5.0      # safe ⛔ during guidance
 
     # Blend weights (0..1): 0=keep Supervisor, 1=use target
-    blend_cross: float = 0.50
-    blend_hold: float = 0.35
+    blend_cross: float   = 0.50
+    blend_hold: float    = 0.35
     blend_capture: float = 0.45
 
     # Hard rails: we never send wild values to the model
-    beta_min: float = 0.5
-    beta_max: float = 3.0
+    beta_min: float  = 0.5
+    beta_max: float  = 3.0
     gamma_min: float = 0.0
     gamma_max: float = 1.5
     clamp_min: float = 1.0
     clamp_max: float = 12.0
+
+    # ── Relaxation (diffusion/decay) modulation knobs ────────────────────────
+    # Squash scales for turning raw signals into “how calm does this look?”
+    relax_F_scale: float      = 1.0    # folds 𝔉 scale
+    relax_eta_scale: float    = 0.02   # share‑rate η scale (smaller ⇒ less calm)
+    relax_lambda_scale: float = 0.10   # letting‑go λ scale
+    relax_D_scale: float      = 0.10   # smoothing D scale
+
+    # How much to modulate at full calmness
+    relax_beta_soften: float        = 0.10  # up to −10% on β
+    relax_gamma_boost: float        = 0.15  # up to +0.15 on γ (additive)
+    relax_clamp_soften: float       = 0.25  # up to −25% on ⛔
+    relax_blend_cross_suppress: float = 0.20  # trim cross‑blend by ≤20%
+    relax_blend_hold_boost: float     = 0.10  # boost hold‑blend by ≤10%
 
 
 # Internal FSM state
@@ -108,6 +135,7 @@ class RungSnapshot:
     delta: float
     band: float
     plan: Optional[Dict[str, Any]]
+    relax: Optional[Dict[str, float]] = None  # {'calm': 0..1}
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -164,6 +192,8 @@ class RungController:
         self.state = _RungState()
         # Pending relative step plan, e.g. {"dir": +1, "steps": 2, "armed": True}
         self._plan: Optional[Dict[str, Any]] = None
+        # Last computed relaxation calmness snapshot
+        self._last_calm: Optional[float] = None
 
     # ——— public API ————————————————————————————————————————————————
 
@@ -234,6 +264,7 @@ class RungController:
             delta=self.delta,
             band=self._epsilon(),
             plan=(dict(self._plan) if self._plan else None),
+            relax=(None if self._last_calm is None else {"calm": float(self._last_calm)}),
         )
         return snap.as_dict()
 
@@ -265,6 +296,12 @@ class RungController:
           'p_half'|'p½'         — barrier probability (~0.5 near ridge)
           'x_mean'              — mean position in X (enables precise k detection)
 
+        Relaxation / diffusion (all optional; ignored if absent):
+          'folds'|'F'|'𝔉'       — cumulative folds 𝔉 along the path/epoch
+          'eta'|'η'             — share rate per unit path (higher ⇒ more active)
+          'lambda'|'λ'          — local letting‑go rate
+          'D'                   — spatial smoothing strength
+
         ctrl_from_supervisor: existing dict with {beta, gamma, clamp}; if None,
         we start from {1.0, 0.5, 5.0} and blend toward our small targets.
 
@@ -281,6 +318,10 @@ class RungController:
         kappa = float(tele.get("kappa", tele.get("κ", 0.0)))
         p_half = tele.get("p_half", tele.get("p½", None))
         x_mean = tele.get("x_mean", None)
+
+        # Optional relaxation inputs → calmness ∈ [0,1]
+        calm = self._relaxation_calm(tele)
+        self._last_calm = calm
 
         # Infer current rung index & residual if possible
         k_now, r = None, None
@@ -302,18 +343,24 @@ class RungController:
         if self.intent == RungIntent.STABILIZE:
             # Keep within acceptance band; increase damping near barriers.
             target = self._target_stabilize(p_half=p_half)
-            return self._blend(ctrl, target, self.tuning.blend_hold)
+            target = self._apply_relaxation(target, calm, phase=self.state.phase)
+            w = self._relax_blend_weight(self.tuning.blend_hold, calm, phase="LOCKED")
+            return self._blend(ctrl, target, w)
 
         if self.intent == RungIntent.HOLD:
             # Gently center on the nearest rung and keep it quiet.
             target = self._target_hold(p_half=p_half)
-            return self._blend(ctrl, target, self.tuning.blend_hold)
+            target = self._apply_relaxation(target, calm, phase=self.state.phase)
+            w = self._relax_blend_weight(self.tuning.blend_hold, calm, phase="LOCKED")
+            return self._blend(ctrl, target, w)
 
         if self.intent == RungIntent.SEEK:
             # Walk toward a target rung; if missing, fall back to HOLD.
             if self.k_target is None or k_now is None:
                 target = self._target_hold(p_half=p_half)
-                return self._blend(ctrl, target, self.tuning.blend_hold)
+                target = self._apply_relaxation(target, calm, phase="LOCKED")
+                w = self._relax_blend_weight(self.tuning.blend_hold, calm, phase="LOCKED")
+                return self._blend(ctrl, target, w)
 
             # Direction toward target (+1 up, −1 down, 0 at target)
             dirn = 0
@@ -323,7 +370,10 @@ class RungController:
                 dirn = -1
 
             target, completed = self._target_step(direction=dirn, p_half=p_half, r=r, kappa=kappa)
-            out = self._blend(ctrl, target, target.pop("_blend", self.tuning.blend_cross))
+            target = self._apply_relaxation(target, calm, phase=self.state.phase)
+            w0 = target.pop("_blend", self.tuning.blend_cross)
+            w = self._relax_blend_weight(w0, calm, phase=self.state.phase)
+            out = self._blend(ctrl, target, w)
 
             # If we finished capturing a rung:
             if completed:
@@ -492,6 +542,88 @@ class RungController:
         self.state.phase = "LOCKED"
         self.state.dwell = 0
         return {"beta": T.beta_hold, "gamma": T.gamma_damp_hi, "clamp": T.clamp_safe, "_blend": T.blend_hold}, False
+
+    # ——— relaxation helpers ————————————————————————————————————————————
+
+    def _relaxation_calm(self, tele: Dict[str, Any]) -> float:
+        """
+        Turn optional diffusion/decay signals into a single calmness ∈ [0,1].
+
+        Heuristics (monotone, bounded):
+          • More folds 𝔉 or larger λ, D → *more calm*.
+          • Larger η (share‑rate now) → *less calm*.
+        """
+        T = self.tuning
+
+        def _get(keys: tuple[str, ...]) -> Optional[float]:
+            for k in keys:
+                if k in tele and tele[k] is not None:
+                    try:
+                        return float(tele[k])
+                    except Exception:
+                        pass
+            return None
+
+        def _squash_pos(x: Optional[float], scale: float) -> Optional[float]:
+            if x is None or scale <= 0:
+                return None
+            v = abs(float(x))
+            return v / (v + scale)
+
+        F  = _get(("F", "𝔉", "folds", "mathcalF", "mathcal_f"))
+        eta = _get(("eta", "η"))
+        lam = _get(("lambda", "λ"))
+        D   = _get(("D", "smooth", "smoothing"))
+
+        parts: list[float] = []
+        sF  = _squash_pos(F,   T.relax_F_scale)
+        sL  = _squash_pos(lam, T.relax_lambda_scale)
+        sD  = _squash_pos(D,   T.relax_D_scale)
+        sE  = _squash_pos(eta, T.relax_eta_scale)
+
+        if sF is not None: parts.append(sF)
+        if sL is not None: parts.append(sL)
+        if sD is not None: parts.append(sD)
+        if sE is not None: parts.append(1.0 - sE)  # higher η ⇒ less calm
+
+        if not parts:
+            return 0.0
+        calm = sum(parts) / len(parts)
+        return float(max(0.0, min(1.0, calm)))
+
+    def _apply_relaxation(self, target: Dict[str, float], calm: float, *, phase: ModePhase) -> Dict[str, float]:
+        """Adjust {β,γ,⛔} gently as calm ↑. No effect if calm≈0."""
+        if calm <= 0.0:
+            return target
+        T = self.tuning
+        beta  = float(target.get("beta",  T.beta_hold))
+        gamma = float(target.get("gamma", 0.5))
+        clamp = float(target.get("clamp", T.clamp_safe))
+
+        # Slightly soften β (less jumpy) — a bit stronger in LOCKED/CAPTURE
+        beta_soft = T.relax_beta_soften * calm * (1.0 if phase in {"LOCKED", "CAPTURE"} else 0.5)
+        beta = beta * (1.0 - beta_soft)
+
+        # Slightly raise γ (more damping) — capped by rails later
+        gamma = gamma + T.relax_gamma_boost * calm
+
+        # Slightly soften clamp (smaller excursions)
+        clamp = clamp * (1.0 - T.relax_clamp_soften * calm)
+
+        out = dict(target)
+        out.update({"beta": beta, "gamma": gamma, "clamp": clamp})
+        return out
+
+    def _relax_blend_weight(self, w: float, calm: float, *, phase: ModePhase | str) -> float:
+        """Phase‑aware tweak of the blend weight with calmness."""
+        if calm <= 0.0:
+            return float(min(max(w, 0.0), 1.0))
+        T = self.tuning
+        if phase in {"MID", "CROSSING"}:
+            w = w * (1.0 - T.relax_blend_cross_suppress * calm)
+        else:  # LOCKED / CAPTURE / fallback
+            w = w + (T.relax_blend_hold_boost * calm)
+        return float(min(max(w, 0.0), 1.0))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
