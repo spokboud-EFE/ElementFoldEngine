@@ -28,10 +28,18 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 from collections import deque
 from typing import Any, Dict, List, Optional
+
+__all__ = [
+    "banner", "gauge", "progress", "format_seconds",
+    "info", "success", "warn", "error", "debug",
+    "section", "kv", "param",
+    "recent", "recent_json", "clear_recent",
+]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Capability detection
@@ -42,11 +50,16 @@ def _supports_unicode() -> bool:
     return "UTF" in enc.upper()
 
 def _supports_color() -> bool:
-    # Very conservative: if stdout isatty, assume color unless NO_COLOR set.
-    if "NO_COLOR" in getattr(sys.environ, "__getitem__", lambda *_: {})("NO_COLOR", {}):
+    """
+    Very conservative color support:
+      • honor NO_COLOR if present,
+      • require a TTY,
+      • otherwise disable color.
+    """
+    if "NO_COLOR" in os.environ:
         return False
     try:
-        return sys.stdout.isatty()
+        return bool(sys.stdout.isatty())
     except Exception:
         return False
 
@@ -140,7 +153,7 @@ def banner(delta: float, beta: float, gamma: float) -> str:
 
 def gauge(name: str, val: float, maxv: float, width: int = 10) -> str:
     m = max(1e-12, float(maxv))
-    v = float(val); 
+    v = float(val)
     if not math.isfinite(v): v = 0.0
     v = min(max(v, 0.0), m)
     w = max(1, int(width))
@@ -263,15 +276,19 @@ def param(
       κ 0.91  [██████░░]  — coherence high near rung; next: hold / tick 3
     """
     # Left label + value
-    val_txt = f"{float(value):.3f}" if math.isfinite(float(value)) else "n/a"
+    try:
+        is_finite = math.isfinite(float(value))
+    except Exception:
+        is_finite = False
+    val_txt = f"{float(value):.3f}" if is_finite else "n/a"
     left = f"{name} {val_txt}"
     if unit:
         left += f" {unit}"
 
     # Optional bar
     bar_txt = ""
-    if maxv is not None and math.isfinite(float(value)):
-        bar_txt = "  " + gauge("", float(value), float(maxv), width=width)[1:]  # drop first char to remove label
+    if (maxv is not None) and is_finite:
+        bar_txt = "  " + gauge("", float(value), float(maxv), width=width)[1:]  # drop first char (label)
 
     # Meaning + advice
     meaning = (meaning or "").strip()
