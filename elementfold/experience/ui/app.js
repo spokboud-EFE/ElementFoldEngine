@@ -4,11 +4,11 @@
    No frameworks; just fetch() to the same-origin server.py endpoints.
 
    Upgrades in this version:
-     • Progressive “adapter panel” helpers (status/spec/tick/driver/delta).
+     • Progressive “adapter panel” helpers (status/spec→help/tick/driver/delta).
      • Parses adapter tick lines for ℱ, z, A and surfaces them as badges
        if an element with id="predBadges" exists (optional).
-     • Safer error handling + Ctrl+Enter to send /steer.
-     • Works with your current HTML; extra controls are bound only if present.
+     • Safer error handling + Ctrl+Enter to send /steer and /infer.
+     • Optional "relax" block for /infer if advanced inputs are present.
    ────────────────────────────────────────────────────────────────────────── */
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -30,6 +30,16 @@ const toppInp       = el("topp");
 const inferTokens   = el("inferTokens");
 const inferLedger   = el("inferLedger");
 
+// (Optional) Relaxation inputs — only used if present
+const relaxEta      = el("relaxEta");        // number
+const relaxW        = el("relaxWeight");     // number (eta_path_weight)
+const relaxRho      = el("relaxRho");        // number
+const relaxLambda   = el("relaxLambda");     // number
+const relaxD        = el("relaxD");          // number
+const relaxPhiInf   = el("relaxPhiInf");     // number
+const relaxSteps    = el("relaxSteps");      // integer
+const relaxDt       = el("relaxDt");         // number
+
 // Steering / adapters panel
 const modalitySel   = el("modality");
 const steerPrompt   = el("steerPrompt");
@@ -46,7 +56,7 @@ const btnTick5      = el("btnTick5");
 const btnHold       = el("btnHold");
 const btnUp         = el("btnStepUp");
 const btnDown       = el("btnStepDown");
-const driverSel     = el("driverSelect");  // values: sim|null|live (live passthrough if not supported)
+const driverSel     = el("driverSelect");  // values: sim|null|live (live becomes no-op if not supported)
 const deltaInp      = el("deltaValue");
 const btnDeltaSet   = el("btnDeltaSet");
 const predBadges    = el("predBadges");    // container for ℱ / z / A badges (optional)
@@ -80,10 +90,54 @@ async function get(path) {
 async function onHealth() {
   try {
     const res = await get("/health");
-    statusEl.textContent = res.ok ? "status: ✓ healthy" : "status: ✖ unhealthy";
+    statusEl && (statusEl.textContent = res.ok ? "status: ✓ healthy" : "status: ✖ unhealthy");
   } catch (e) {
-    statusEl.textContent = `status: ✖ cannot reach /health (${e.message})`;
+    statusEl && (statusEl.textContent = `status: ✖ cannot reach /health (${e.message})`);
   }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Relaxation payload builder (optional panel)
+// ──────────────────────────────────────────────────────────────────────────
+function buildRelaxPayloadIfAny() {
+  // If no relax fields exist, don’t send anything.
+  if (!relaxEta && !relaxW && !relaxRho && !relaxLambda && !relaxD && !relaxPhiInf && !relaxSteps && !relaxDt) {
+    return null;
+  }
+
+  // Helper: parse number safely
+  const num = (inp) => {
+    if (!inp) return null;
+    const v = parseFloat((inp.value || "").trim());
+    return Number.isFinite(v) ? v : null;
+  };
+  const int = (inp) => {
+    if (!inp) return null;
+    const v = parseInt((inp.value || "").trim(), 10);
+    return Number.isFinite(v) ? v : null;
+  };
+
+  const relax = {};
+  const eta    = num(relaxEta);
+  const w      = num(relaxW);
+  const rho    = num(relaxRho);
+  const lam    = num(relaxLambda);
+  const D      = num(relaxD);
+  const phiInf = num(relaxPhiInf);
+  const steps  = int(relaxSteps);
+  const dt     = num(relaxDt);
+
+  if (eta   != null) relax.eta = eta;
+  if (w     != null) relax.eta_path_weight = w;
+  if (rho   != null) relax.rho = rho;
+  if (lam   != null) relax["lambda"] = lam;
+  if (D     != null) relax.D = D;
+  if (phiInf!= null) relax.phi_inf = phiInf;
+  if (steps != null && steps >= 1) relax.steps = steps;
+  if (dt    != null) relax.dt = dt;
+
+  // If nothing valid was provided, return null to avoid sending an empty object.
+  return Object.keys(relax).length ? relax : null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -105,18 +159,26 @@ async function onInfer() {
   const text = (inferText?.value || "").trim();
   if (text.length > 0) payload.text = text;
 
+  // Optional: include relaxation block if advanced inputs exist
+  const relax = buildRelaxPayloadIfAny();
+  if (relax) payload.relax = relax;
+
   try {
     const out = await postJSON("/infer", payload);
     const toks = Array.isArray(out.tokens) ? out.tokens : [];
     const ledg = Array.isArray(out.ledger) ? out.ledger : [];
 
     const head = toks.slice(0, 64);
-    inferTokens.textContent = JSON.stringify(head, null, 2) + (toks.length > 64 ? " …" : "");
+    if (inferTokens) {
+      inferTokens.textContent = JSON.stringify(head, null, 2) + (toks.length > 64 ? " …" : "");
+    }
 
-    const mean = ledg.reduce((a, b) => a + b, 0) / Math.max(1, ledg.length);
-    inferLedger.textContent = `${Number.isFinite(mean) ? mean.toFixed(6) : "n/a"}  (mean over ${ledg.length})`;
+    if (inferLedger) {
+      const mean = ledg.reduce((a, b) => a + b, 0) / Math.max(1, ledg.length);
+      inferLedger.textContent = `${Number.isFinite(mean) ? mean.toFixed(6) : "n/a"}  (mean over ${ledg.length})`;
+    }
   } catch (e) {
-    inferTokens.textContent = `error: ${e.message}`;
+    if (inferTokens) inferTokens.textContent = `error: ${e.message}`;
     if (inferLedger) inferLedger.textContent = "";
   }
 }
@@ -131,11 +193,11 @@ async function steer(modality, prompt) {
 
 function renderSteerText(text) {
   // reset audio preview
-  if (audioRow)  audioRow.style.display = "none";
+  if (audioRow)    audioRow.style.display = "none";
   if (audioPlayer) audioPlayer.src = "";
 
   // show text
-  steerOut.textContent = text;
+  if (steerOut) steerOut.textContent = text;
 
   // parse predictions if present, surface as badges when predBadges exists
   tryParseAndRenderPredictions(text);
@@ -145,8 +207,14 @@ function renderSteerText(text) {
     const phase = (text.match(/phase=([A-Z]+)/) || [])[1] || "?";
     const kap   = parseFloat((text.match(/κ=([0-9.]+)/) || [])[1] || "NaN");
     const phalf = parseFloat((text.match(/p½=([0-9.]+)/) || [])[1] || "NaN");
-    adapterStatus.textContent =
-      `phase=${phase} • κ=${Number.isFinite(kap)?kap.toFixed(3):"?"} • p½=${Number.isFinite(phal f)?phal f.toFixed(3):"?"}`;
+    const mCtrl = text.match(/ctrl=\{β:([0-9.]+),\s*γ:([0-9.]+),\s*⛔:([0-9.]+)\}/);
+    const beta  = mCtrl ? parseFloat(mCtrl[1]) : NaN;
+    const gamma = mCtrl ? parseFloat(mCtrl[2]) : NaN;
+    const clamp = mCtrl ? parseFloat(mCtrl[3]) : NaN;
+
+    const base = `phase=${phase} • κ=${Number.isFinite(kap) ? kap.toFixed(3) : "?"} • p½=${Number.isFinite(phalf) ? phalf.toFixed(3) : "?"}`;
+    const ctrl = mCtrl ? ` • β=${beta.toFixed(2)} γ=${gamma.toFixed(2)} ⛔=${clamp.toFixed(1)}` : "";
+    adapterStatus.textContent = base + ctrl;
   }
 }
 
@@ -157,7 +225,7 @@ function renderSteerPayload(out) {
     return;
   }
   // JSON-ish → pretty print
-  steerOut.textContent = JSON.stringify(out.output, null, 2);
+  if (steerOut) steerOut.textContent = JSON.stringify(out.output, null, 2);
 
   // if audio data URL present, preview it
   const dataUrl = out?.output?.data_url || null;
@@ -175,7 +243,7 @@ async function onSteer() {
     const out = await steer(modality, prompt);
     renderSteerPayload(out);
   } catch (e) {
-    steerOut.textContent = `error: ${e.message}`;
+    if (steerOut) steerOut.textContent = `error: ${e.message}`;
     if (audioRow) audioRow.style.display = "none";
     if (audioPlayer) audioPlayer.src = "";
   }
@@ -219,11 +287,12 @@ async function runAdapterCmd(cmd) {
     const out = await steer(modality, cmd);
     renderSteerPayload(out);
   } catch (e) {
-    steerOut.textContent = `error: ${e.message}`;
+    if (steerOut) steerOut.textContent = `error: ${e.message}`;
   }
 }
 
-async function onSpec()   { await runAdapterCmd("spec"); }     // falls back to help if unknown
+// Note: resonator doesn’t implement 'spec', so map it to 'help' for now.
+async function onSpec()   { await runAdapterCmd("help"); }
 async function onStatus() { await runAdapterCmd("status"); }
 async function onTick1()  { await runAdapterCmd("tick 1"); }
 async function onTick5()  { await runAdapterCmd("tick 5"); }
@@ -242,7 +311,7 @@ async function onDeltaSet() {
   if (!deltaInp) return;
   const val = parseFloat((deltaInp.value || "").trim());
   if (!Number.isFinite(val)) {
-    steerOut.textContent = "error: delta must be a number";
+    if (steerOut) steerOut.textContent = "error: delta must be a number";
     return;
   }
   await runAdapterCmd(`delta ${val}`);
@@ -254,6 +323,12 @@ async function onDeltaSet() {
 on(btnHealth, "click", onHealth);
 
 on(btnInfer , "click", onInfer);
+on(inferText, "keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    onInfer();
+  }
+});
 
 on(btnSteer , "click", onSteer);
 on(steerPrompt, "keydown", (e) => {

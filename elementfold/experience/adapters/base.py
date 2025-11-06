@@ -329,7 +329,7 @@ class AdapterRegistry:
                 # Suggest up to 3 close matches (threshold tuned for short names)
                 matches = difflib.get_close_matches(key, avail, n=3, cutoff=0.6)
                 if matches:
-                    hint = f"  did you mean: {, ".join(matches)}?"
+                    hint = f"  did you mean: {', '.join(matches)}?"
             available = ", ".join(avail) if avail else "∅ (none registered)"
             raise KeyError(f"adapter:{key} not found; available = [{available}].{hint}") from None
 

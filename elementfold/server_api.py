@@ -11,12 +11,14 @@
 #   • Strategy synonyms accepted ('argmax'→'greedy', 'sampling'→'sample').
 #   • Token lists accept tuples/iterables in addition to lists.
 #   • Top‑level JSON must be an *object* (dict); arrays/scalars are rejected with a 400.
+#   • NEW: optional 'relax' block for diffusion/decay (“relaxation clock”) knobs.
 
 from __future__ import annotations                # ✴ forward type hints
 from dataclasses import dataclass, asdict         # ✴ tiny, typed records
 from typing import Optional, List, Dict, Any, Iterable
 import json                                       # ✴ JSON encode/decode
 import math                                       # ✴ finite checks
+
 
 # ———————————————————————————————————————————————————————————
 # Request / Response schemas (small, explicit dataclasses)
@@ -31,12 +33,17 @@ class InferRequest:                               # ✴ /infer input
     top_k: Optional[int] = None                   # keep K tokens (sampling)
     top_p: Optional[float] = None                 # nucleus prob in (0,1) (sampling)
     max_len: Optional[int] = None                 # optional hard cap for sequence length
+    # NEW: optional relaxation‑clock knobs; shape is a small dict, all fields optional.
+    # Example payload:
+    #   "relax": {"eta":0.02, "eta_path_weight":0.5, "rho":0.25, "lambda":0.0, "D":0.0, "steps":1, "dt":1.0}
+    relax: Optional[Dict[str, Any]] = None
 
 @dataclass
 class InferResponse:                              # ✴ /infer output
     tokens: List[int]                             # decoded token ids
     ledger: List[float]                           # flattened ledger coordinates
     text: Optional[str] = None                    # optional detokenized text
+    # (If we later expose relaxation outputs, we can extend here with Optionals.)
 
 @dataclass
 class SteerRequest:                               # ✴ /steer input
@@ -69,6 +76,7 @@ class ErrorResponse:                              # ✴ unified errors
     code: str                                     # short code (e.g., 'bad_request')
     message: str                                  # human‑readable description
     details: Optional[Dict[str, Any]] = None      # optional payload for debugging
+
 
 # ———————————————————————————————————————————————————————————
 # JSON helpers (bytes⇄dict) with dataclass support
@@ -106,6 +114,7 @@ def to_json(obj: Any) -> bytes:
         obj = asdict(obj)                           # ✴ serialize @dataclass
     obj = _json_sanitize(obj)                       # ✴ ensure RFC‑clean numbers
     return json.dumps(obj, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
 
 # ———————————————————————————————————————————————————————————
 # Light validation + coercion utilities for /infer
@@ -183,6 +192,49 @@ def _clean_max_len(m: Any) -> Optional[int]:
         return None
     return m if m > 0 else None
 
+# ——— NEW: permissive sanitizer for the 'relax' block ————————————————
+
+_RELAX_KEYS_FLOAT = ("eta", "eta_path_weight", "rho", "lambda", "D", "dt")
+_RELAX_KEYS_INT   = ("steps",)
+
+def _clean_relax(x: Any) -> Optional[Dict[str, Any]]:
+    """
+    Accept a dict of relaxation‑clock knobs; coerce types and clamp to safe ranges.
+    Unknown keys are dropped. Returns None if input is unusable.
+    Fields (all optional):
+      • eta              ≥ 0 (per‑step share rate)
+      • eta_path_weight  ∈ [0,1] (mix of path‑length vs. local terms)
+      • rho              ∈ [0,1] (coupling strength to background)
+      • lambda           ≥ 0 (local letting‑go rate)
+      • D                ≥ 0 (smoothing strength)
+      • steps            ≥ 1 (inner relaxation steps per decode)
+      • dt               > 0 (time step for the inner update)
+    """
+    if not isinstance(x, dict):
+        return None
+    out: Dict[str, Any] = {}
+    for k in _RELAX_KEYS_FLOAT:
+        if k in x:
+            try:
+                v = float(x[k])
+                if k in ("eta_path_weight", "rho"):
+                    v = min(max(v, 0.0), 1.0)
+                elif k in ("lambda", "D", "eta"):
+                    v = max(0.0, v)
+                elif k == "dt":
+                    v = max(1e-9, v)
+                out[k] = v
+            except Exception:
+                pass
+    for k in _RELAX_KEYS_INT:
+        if k in x:
+            try:
+                v = int(x[k])
+                out[k] = max(1, v)
+            except Exception:
+                pass
+    return out or None
+
 def coerce_infer_request(payload: Dict[str, Any]) -> InferRequest:
     """
     Convert a raw dict (from JSON) into an InferRequest with cleaned fields.
@@ -194,14 +246,17 @@ def coerce_infer_request(payload: Dict[str, Any]) -> InferRequest:
     top_k = _clean_top_k(payload.get("top_k"))
     top_p = _clean_top_p(payload.get("top_p"))
     max_len = _clean_max_len(payload.get("max_len"))
+    relax = _clean_relax(payload.get("relax"))
     return InferRequest(tokens=tokens, text=text, strategy=strategy,
-                        temperature=temperature, top_k=top_k, top_p=top_p, max_len=max_len)
+                        temperature=temperature, top_k=top_k, top_p=top_p,
+                        max_len=max_len, relax=relax)
 
 def validate_infer_request(req: InferRequest) -> Optional[ErrorResponse]:
     """
     Sanity checks:
       • at least one of (tokens, text) must be provided,
       • strategy must be in the allowed set.
+      • 'relax' is optional and permissively sanitized by coerce_infer_request().
     Returns None when valid, or an ErrorResponse.
     """
     if (req.tokens is None) and (not req.text):
@@ -217,14 +272,19 @@ def normalized_decode_args(req: InferRequest) -> Dict[str, Any]:
     Convenience: return a dict you can unpack into Engine.infer(...).
     • For 'greedy', sampling knobs are nulled.
     • For 'sample', ensure temperature>0; top_k/top_p are passed through as cleaned.
+    • 'relax' is passed through verbatim (already sanitized).
     """
+    base = {"relax": req.relax}
     if req.strategy == "greedy":
-        return {"strategy": "greedy", "temperature": 1.0, "top_k": None, "top_p": None}
+        base.update({"strategy": "greedy", "temperature": 1.0, "top_k": None, "top_p": None})
+        return base
     # sample
-    return {"strategy": "sample",
-            "temperature": max(1e-8, float(req.temperature)),
-            "top_k": req.top_k,
-            "top_p": req.top_p}
+    base.update({"strategy": "sample",
+                 "temperature": max(1e-8, float(req.temperature)),
+                 "top_k": req.top_k,
+                 "top_p": req.top_p})
+    return base
+
 
 # ———————————————————————————————————————————————————————————
 # Tokenization helpers (pure‑Python; server wires a tokenizer)
@@ -252,6 +312,7 @@ def resolve_tokens(req: InferRequest, tokenizer, vocab: int, seq_len: int) -> Li
         ids = []
     ids = [max(0, min(int(t), vocab - 1)) for t in (ids or [0])]
     return ids[:limit]
+
 
 # ———————————————————————————————————————————————————————————
 # Response packers
