@@ -13,7 +13,8 @@
 #
 # Commands (typed as the “text” in Studio when /mod resonator is active):
 #   help                    — show this cheat‑sheet
-#   status                  — print controller + driver snapshot
+#   spec                    — show the adapter contract (expected tensors, outputs)
+#   status                  — print controller + driver snapshot (+ feed readiness)
 #   init δ=0.5              — reset session and set δ⋆ (click size)
 #   hold                    — lock the nearest rung (intent=hold)
 #   step up [N]             — cross upward N clicks (default 1)
@@ -21,7 +22,9 @@
 #   seek k=<K>              — seek to absolute rung index K
 #   delta <value>           — change δ⋆ on the fly
 #   tick [N]                — run N control ticks (default 1) with live telemetry
-#   driver sim|null         — switch between a simulator and a no‑op sink
+#   pred on|off|reset       — show/hide/reset relaxation predictions (ℱ, z, e^{-2ℱ})
+#   driver sim|null|live    — switch between simulator, no‑op, or live‑feed driver
+#   feed clear              — (live) drop any attached feed (runner.set_feed(...) exists)
 #
 # Telemetry keys expected from drivers:
 #   {"delta"|"δ⋆", "kappa"|"κ", "p_half"|"p½", "x_mean"}
@@ -33,14 +36,53 @@
 # driver as long as it honors read_telemetry/apply_control contracts.
 from __future__ import annotations
 
-from typing import Dict, Optional, Callable, Tuple
+from typing import Dict, Optional, Callable, Tuple, Any
 import re
 import math
 
-from elementfold.rung_controller import RungController, RungIntent
+from elementfold.rung_controller import RungController
 from elementfold.control import Supervisor
-from .base import AdapterRegistry
 
+# New: adapter spec / readiness plumbing (compatible additions in base.py)
+from .base import (
+    AdapterRegistry,
+    AdapterSpec,
+    TensorSpec,
+    with_spec,
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Adapter contract (plain words)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# We declare what a “live” resonator expects if a device is attached. We keep
+# it *minimal* on purpose: a single 1‑D tensor “X” of ledger positions (δ⋆
+# clicks) is enough to compute κ, p½, and x_mean. Studio (or your driver code)
+# can call `runner.set_feed({"X": torch.tensor([...])})`. If no feed is present,
+# the adapter happily runs in simulator mode.
+
+try:
+    import torch  # optional (only used for dtype name in pretty docs)
+    _float32 = torch.float32
+except Exception:  # pragma: no cover
+    torch = None   # type: ignore
+    _float32 = "float32"  # human-friendly fallback
+
+_resonator_spec = AdapterSpec(
+    name="resonator",
+    description="Rung‑aware resonator control. Accepts live ledger values X (δ⋆ clicks) or simulates.",
+    expects={
+        # Rank‑1 time series of ledger seats. If you need (B,T), stream B traces one at a time.
+        "X": TensorSpec(shape=(-1,), dtype=_float32, device="any",
+                        doc="ledger positions (δ⋆ units); shape (T,)"),
+        # (Optional) You can still change δ⋆ with the 'delta' command; not enforced here.
+    },
+    predicts={
+        "ctrl": "β (responsiveness), γ (damping), ⛔ (clamp) per tick",
+        "folds": "ℱ — cumulative relaxation folds; z = e^ℱ − 1; dim tilt A ≈ e^{−2ℱ}",
+    },
+    wait="allow_sim",  # if feed missing, offer simulation instead of blocking
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Lightweight drivers
@@ -59,7 +101,6 @@ class _BaseDriver:
     def snapshot(self) -> Dict[str, float]:
         """Optional debug snapshot for status printing."""
         return {}
-
 
 class SimResonatorDriver(_BaseDriver):
     """
@@ -81,9 +122,10 @@ class SimResonatorDriver(_BaseDriver):
         return k, r
 
     def read_telemetry(self, delta: float) -> Dict[str, float]:
-        k, r = self._fold(self.x, delta)
+        _, r = self._fold(self.x, delta)
+        half = 0.5 * delta if delta > 0 else 1.0
         # Barrier nearness proxy: 0 at rung center, 1 near half‑step
-        phalf = min(1.0, abs(r) / (0.5 * delta)) if delta > 0 else 0.0
+        phalf = min(1.0, abs(r) / max(1e-9, half))
         # Coherence proxy: high near rung, low near barrier
         kappa = max(0.0, 1.0 - phalf)
         return {
@@ -110,23 +152,80 @@ class SimResonatorDriver(_BaseDriver):
         out.update({f"ctrl_{k}": v for k, v in self.last_ctrl.items()})
         return out
 
-
 class NullDriver(_BaseDriver):
     """No‑op sink; useful to sanity‑check the adapter without a simulator."""
     def read_telemetry(self, delta: float) -> Dict[str, float]:
         return {"δ⋆": float(delta), "delta": float(delta), "κ": 0.0, "p½": 0.0, "x_mean": 0.0}
-
     def apply_control(self, beta: float, gamma: float, clamp: float) -> None:
         pass
+
+class LiveFeedDriver(_BaseDriver):
+    """
+    Live driver that *reads* telemetry from an injected feed:
+        runner.set_feed({"X": torch.tensor([...])})
+
+    We consume one sample per tick and synthesize the same telemetry keys the
+    controller expects: κ, p½, x_mean. This is deliberately simple and stable.
+    """
+    def __init__(self, feed_ref: Dict[str, Any]):
+        self._feed_ref = feed_ref
+        self._i = 0
+        self._last_ctrl = {"beta": 1.0, "gamma": 0.5, "clamp": 5.0}
+
+    def _current_x(self) -> Optional[float]:
+        X = self._feed_ref.get("X", None)
+        if X is None:
+            return None
+        try:
+            # numpy / torch / list — all duck‑typed via __len__/__getitem__
+            if len(X) == 0:
+                return None
+            i = min(self._i, len(X) - 1)
+            v = X[i]
+            # Torch / numpy scalar → Python float
+            return float(v.item()) if hasattr(v, "item") else float(v)
+        except Exception:
+            return None
+
+    def read_telemetry(self, delta: float) -> Dict[str, float]:
+        x = self._current_x()
+        if x is None:
+            # Not ready; return a neutral telemetry snapshot
+            return {"δ⋆": float(delta), "delta": float(delta), "κ": 0.0, "p½": 0.0, "x_mean": 0.0}
+        # Compute residual and simple κ/p½ proxies (same as simulator)
+        k = int(math.floor((x / delta) + 0.5)) if delta > 0 else 0
+        r = x - k * delta
+        half = 0.5 * delta if delta > 0 else 1.0
+        phalf = min(1.0, abs(r) / max(1e-9, half))
+        kappa = max(0.0, 1.0 - phalf)
+        return {
+            "δ⋆": float(delta),
+            "delta": float(delta),
+            "κ": float(kappa),
+            "kappa": float(kappa),
+            "p½": float(phalf),
+            "p_half": float(phalf),
+            "x_mean": float(x),
+        }
+
+    def apply_control(self, beta: float, gamma: float, clamp: float) -> None:
+        # Live mode does not “move” hardware; we just advance the cursor along X.
+        self._last_ctrl = {"beta": beta, "gamma": gamma, "clamp": clamp}
+        self._i += 1  # consume one sample per tick
+
+    def snapshot(self) -> Dict[str, float]:
+        out = {"i": self._i}
+        out.update({f"ctrl_{k}": v for k, v in self._last_ctrl.items()})
+        return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Accepts: help | status | init | hold | step [up|down] [N] | seek ... | delta ... | tick ... | driver ...
+# Accepts: help | spec | status | init | hold | step | seek | delta | tick | driver | feed
 _CMD_RE = re.compile(
-    r'^\s*(?P<cmd>help|status|init|hold|step(?:\s+(?:up|down))?|seek|delta|tick|driver)\b(?P<rest>.*)$',
+    r'^\s*(?P<cmd>help|spec|status|init|hold|seek|delta|tick|driver|step|feed)\b(?P<rest>.*)$',
     re.IGNORECASE,
 )
 
@@ -163,7 +262,7 @@ def _parse_seek_target(rest: str) -> Optional[int]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Adapter factories
+# Adapter factory and runner
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _make_runner(kind: str) -> Callable:
@@ -171,10 +270,38 @@ def _make_runner(kind: str) -> Callable:
     Build a stateful runner. 'kind' is a flavor tag (e.g., 'resonator', 'interferometer').
     Keeps driver + supervisor + rung controller alive across invocations.
     """
+
+    # Runtime state
     driver: _BaseDriver = SimResonatorDriver()  # default simulator
     sup = Supervisor()
     delta = 0.5
     rung = RungController(delta=delta)          # starts in intent=STABILIZE
+
+    # Live‑feed store (for driver=live); Studio can set via runner.set_feed(...)
+    feed: Dict[str, Any] = {}
+
+    # Relaxation predictions (ℱ clock). We keep it deliberately simple:
+    #   η ≈ η0 + a·p½ + b·(1−κ), then ℱ ← ℱ + η  (per tick)
+    # Use gentle coefficients; Studio can reset via 'pred reset'.
+    F = 0.0
+    show_pred = True
+    eta0, a_p, b_k = 0.005, 0.040, 0.020
+
+    def _update_relaxation(tele: Dict[str, float]) -> Tuple[float, float, float]:
+        nonlocal F
+        kappa = float(tele.get("κ", tele.get("kappa", 0.0)))
+        phalf = float(tele.get("p½", tele.get("p_half", 0.0)))
+        eta = max(0.0, eta0 + a_p * phalf + b_k * (1.0 - kappa))
+        F = max(0.0, F + eta)  # monotone clock
+        z = math.exp(F) - 1.0
+        atten = math.exp(-2.0 * F)
+        return (F, z, atten)
+
+    def _pred_suffix(tele: Dict[str, float]) -> str:
+        if not show_pred:
+            return ""
+        Fv, zv, av = _update_relaxation(tele)
+        return f"  ℱ={Fv:.3f}  z={zv:.3f}  A≈e^(-2ℱ)={av:.3f}"
 
     def _tick(n: int = 1) -> str:
         lines = []
@@ -193,11 +320,25 @@ def _make_runner(kind: str) -> Callable:
                 f"κ={tele.get('κ', tele.get('kappa', 0.0)):.3f} "
                 f"p½={tele.get('p½', tele.get('p_half', 0.0)):.3f} "
                 f"ctrl={{β:{ctrl_out['beta']:.2f}, γ:{ctrl_out['gamma']:.2f}, ⛔:{ctrl_out['clamp']:.1f}}}"
+                + _pred_suffix(tele)
             )
         return "\n".join(lines)
 
+    def _pretty_spec() -> str:
+        spec = AdapterRegistry.spec("resonator") or _resonator_spec
+        return "contract:\n" + spec.pretty()
+
+    def _readiness_summary() -> str:
+        # Validate current feed (if any) against the spec
+        rep = AdapterRegistry.validate("resonator", feed)
+        # Short UX string
+        if rep.ok:
+            return "feed: ✓ ready"
+        msg = "feed: wait — " + rep.summary
+        return msg
+
     def run(_model, prompt: str, _style=None) -> str:
-        nonlocal delta, driver, sup, rung
+        nonlocal delta, driver, sup, rung, F, show_pred
         if not isinstance(prompt, str) or not prompt.strip():
             prompt = "help"
 
@@ -206,13 +347,14 @@ def _make_runner(kind: str) -> Callable:
             # Default action: run one tick
             return _tick(1)
 
-        cmd = m.group("cmd").lower()
+        cmd = (m.group("cmd") or "").lower()
         rest = (m.group("rest") or "").strip()
 
         if cmd == "help":
             return (
                 f"[{kind}] commands:\n"
                 "  help                    — this help\n"
+                "  spec                    — show expected inputs / predicted outputs\n"
                 "  status                  — controller + driver snapshot\n"
                 "  init δ=<value>          — reset session and set δ⋆\n"
                 "  hold                    — keep the nearest rung centered\n"
@@ -221,8 +363,13 @@ def _make_runner(kind: str) -> Callable:
                 "  seek k=<K>              — seek to absolute rung index K\n"
                 "  delta <value>           — change δ⋆ on the fly\n"
                 "  tick [N]                — run N control ticks\n"
-                "  driver sim|null         — switch driver\n"
+                "  pred on|off|reset       — show/hide/reset relaxation predictions\n"
+                "  driver sim|null|live    — switch driver\n"
+                "  feed clear              — clear any attached live feed\n"
             )
+
+        if cmd == "spec":
+            return _pretty_spec()
 
         if cmd == "status":
             st = rung.status()                  # controller snapshot
@@ -235,11 +382,13 @@ def _make_runner(kind: str) -> Callable:
             phase = st.get("phase", "?")
             dwell = st.get("dwell", 0)
             plan = st.get("plan")  # may be None
+            feed_line = _readiness_summary()
             return (
                 "status:\n"
                 f"  intent={intent}  k_target={k_tgt}  phase={phase}  dwell={dwell}\n"
                 f"  δ⋆={st.get('delta', delta)}  band={band}\n"
                 f"  plan={plan}\n"
+                f"  {feed_line}\n"
                 f"  tele={{κ:{tele.get('κ',0):.3f}, p½:{tele.get('p½',0):.3f}, x:{tele.get('x_mean',0):.3f}}}\n"
                 f"  driver={driver.__class__.__name__} • {snap}"
             )
@@ -252,7 +401,14 @@ def _make_runner(kind: str) -> Callable:
             delta = float(new_delta or delta)
             sup = Supervisor()
             rung = RungController(delta=delta)
-            driver = SimResonatorDriver()
+            F = 0.0  # reset predictions clock
+            # Keep current driver choice, but reset its internal state if simulation
+            if isinstance(driver, SimResonatorDriver):
+                driver = SimResonatorDriver()
+            elif isinstance(driver, LiveFeedDriver):
+                driver = LiveFeedDriver(feed)
+            else:
+                driver = NullDriver()
             return f"initialized: δ⋆={delta}"
 
         if cmd == "hold":
@@ -266,20 +422,21 @@ def _make_runner(kind: str) -> Callable:
             rung.seek_to(k)
             return f"intent: seek → k={k}\n" + _tick(4)
 
-        if cmd.startswith("step"):
+        if cmd == "step":
+            # Accept "step up [N]" or "step down [N]"
             up = "down" not in rest.lower()
-            # Try to parse trailing number in “step up 3”; default to 1
-            parts = rest.split()
+            # Extract trailing integer if present; default 1
             n = 1
-            if parts:
+            mnum = re.search(r'(-?\d+)\s*$', rest)
+            if mnum:
                 try:
-                    n = int(parts[-1])
+                    n = max(1, int(mnum.group(1)))
                 except Exception:
                     n = 1
             if up:
-                rung.set_intent("step_up", steps=max(1, n))
+                rung.set_intent("step_up", steps=n)
             else:
-                rung.set_intent("step_down", steps=max(1, n))
+                rung.set_intent("step_down", steps=n)
             return f"intent: step_{'up' if up else 'down'} ×{n}\n" + _tick(max(3, n * 2))
 
         if cmd == "delta":
@@ -291,11 +448,25 @@ def _make_runner(kind: str) -> Callable:
                 return "usage: delta <float>"
             delta = float(val)
             rung.delta = delta  # controller follows runtime δ⋆
+            F = 0.0             # restart predictions for new scale
             return f"δ⋆ set to {delta}"
 
         if cmd == "tick":
             n = _parse_int(rest, 1)
             return _tick(n)
+
+        if cmd == "pred":
+            s = rest.lower()
+            if "reset" in s:
+                F = 0.0
+                return "predictions: ℱ reset to 0"
+            if "off" in s:
+                show_pred = False
+                return "predictions: off"
+            if "on" in s or s == "":
+                show_pred = True
+                return "predictions: on"
+            return "usage: pred on|off|reset"
 
         if cmd == "driver":
             choice = (rest or "").strip().lower()
@@ -305,20 +476,82 @@ def _make_runner(kind: str) -> Callable:
             if choice == "null":
                 driver = NullDriver()
                 return "driver → NullDriver"
-            return "driver choices: sim|null"
+            if choice == "live":
+                driver = LiveFeedDriver(feed)
+                return "driver → LiveFeedDriver (waiting on runner.set_feed({...}))"
+            return "driver choices: sim|null|live"
+
+        if cmd == "feed":
+            if "clear" in rest.lower():
+                feed.clear()
+                return "feed: cleared"
+            return "feed: this command only supports 'feed clear' here; inject data via runner.set_feed({...})"
 
         # Fallback: one tick
         return _tick(1)
 
+    # Attach handy hooks for Studio / scripts (no change to runner signature)
+    def _set_feed(data: Dict[str, Any]) -> str:
+        """Programmatic injection point for live driver feeds (e.g., {'X': tensor})."""
+        nonlocal feed
+        if not isinstance(data, dict):
+            return "set_feed: expected a dict like {'X': tensor}"
+        feed = dict(data)  # shallow copy
+        rep = AdapterRegistry.validate("resonator", feed)
+        return ("feed: ✓ ready" if rep.ok else "feed: wait — " + rep.summary)
+
+    def _get_feed() -> Dict[str, Any]:
+        return dict(feed)
+
+    def _simulate(T: int = 512, noise: float = 0.02, drift: float = 0.1) -> Dict[str, Any]:
+        """
+        Produce a simple synthetic ledger series X for experiments.
+        X wanders across rungs with small noise and drift to exercise crossings.
+        """
+        try:
+            import numpy as np
+        except Exception:
+            np = None
+        if np is None:
+            # minimal fallback without numpy
+            Xs = []
+            x = 0.0
+            for t in range(int(T)):
+                x += drift + noise * (0.5 - (t % 2))
+                Xs.append(x)
+            return {"X": Xs}
+        rng = np.random.default_rng(0xE1F0LD)
+        X = np.zeros(int(T), dtype=float)
+        v = 0.0
+        for t in range(int(T)):
+            # light random walk with occasional pushes through half‑steps
+            a = drift + 0.03 * rng.standard_normal()
+            v = 0.95 * v + a
+            X[t] = (X[t - 1] if t else 0.0) + v + noise * rng.standard_normal()
+        return {"X": X}
+
+    # Decorate runner object with helpful attributes/methods
+    run.__adapter_spec__ = _resonator_spec  # type: ignore[attr-defined]
+    run.set_feed = _set_feed                # type: ignore[attr-defined]
+    run.get_feed = _get_feed                # type: ignore[attr-defined]
+    run.simulate = _simulate                # type: ignore[attr-defined]
     return run
 
 
 @AdapterRegistry.register_fn("resonator")
+@with_spec(_resonator_spec)
 def make_resonator_adapter():
     return _make_runner("resonator")
 
 
 @AdapterRegistry.register_fn("interferometer")
+@with_spec(AdapterSpec(
+    name="interferometer",
+    description="Photonic alias of the resonator contract.",
+    expects=_resonator_spec.expects,
+    predicts=_resonator_spec.predicts,
+    wait=_resonator_spec.wait,
+))
 def make_interferometer_adapter():
     # Alias flavor — identical contract; different name helps discoverability
     return _make_runner("interferometer")
