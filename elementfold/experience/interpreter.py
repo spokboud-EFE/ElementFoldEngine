@@ -1,445 +1,438 @@
 # ElementFold · experience/interpreter.py
 # ──────────────────────────────────────────────────────────────────────────────
-# Tensor‑anchored interpreter:
-#   Turn raw tensors + runtime knobs into a *human* narrative with suggestions.
+# TelemetryInterpreter — anchors live tensors/telemetry to a *short, precise*
+# human narrative + next-step suggestions. It uses a local LLM when available,
+# and a deterministic rule set as a safe fallback.
 #
-# Why this file?
-#   • We want “numbers with meaning” — every scalar gets a sentence.
-#   • We want consistent text for Studio *and* the Web UI (same source of truth).
-#   • We keep it portable (stdlib + torch) and tolerant of missing fields.
+# Inputs (typical keys you can pass in `telemetry`):
+#   {'kappa'|'κ', 'p_half'|'p½', 'margin_min', 'margin_mean', 'resid_std',
+#    'phase_mean', 'delta'|'δ⋆', 'folds' (B×T or T), 'relax_meta': {...}}
 #
-# Inputs (typical):
-#   interpret(
-#     X=ledger_tensor,                    # (B,T) float, optional
-#     delta=cfg.delta,                    # float (δ⋆)
-#     folds=out.get("folds"),             # (B,T) float from infer_loop(relax=...), optional
-#     relax_meta=out.get("relax_meta"),   # dict with {'eta','lambda','D','rho','dt',...}, optional
-#     control={'beta':b, 'gamma':g, 'clamp':c},  # optional
-#     rung=rung_controller.status(),      # optional dict: {'intent','phase','dwell','band',...}
-#     tele_hint={...},                    # optional fast path: {'kappa','p_half',...}
-#   )
+# Optional controller `status` (adapter-supplied):
+#   {'intent','k_target'| 'target_k','phase','band','dwell','plan'}
 #
-# Output (dict, JSON‑friendly):
+# Output (JSON-friendly dict):
 #   {
-#     'headline':  "LOCKED • κ=0.82  p½=0.11  ℱ=0.27  z=1.37  A≈e^(−2ℱ)=0.58",
-#     'caption':   "β=1.28  γ=0.46  ⛔=5.0  |  far from barrier; stable and coherent",
-#     'badges':    {'F':0.27, 'z':1.37, 'A':0.58},
-#     'traffic':   {'coherence':'good', 'barrier':'good', 'stability':'good', 'pace':'warn'},
-#     'metrics':   { 'kappa': {...}, 'p_half': {...}, 'margin_min': {...}, ... },
-#     'next':      ["If you want a crisp lock: /mod resonator → hold → tick 5", ...],
-#     'lines':     ["• κ=0.82 — strong phase alignment (good).", "• p½=0.11 — far from the boundary (good).", ...]
+#     'caption': "✓ κ=0.91 — captured and safe (p½=0.05)",
+#     'bullets': ["phase alignment strong", "safe margin from boundary", ...],
+#     'next_actions': ["tick 2","hold"],
+#     'numbers': {... scalar snapshot ...},
+#     'confidence': 0.0..1.0,
+#     'llm_used': True|False,
+#     'raw_llm': "<raw text>",            # optional, for debugging
+#     'llm_meta': {'backend':..., 'latency_ms':...}  # optional
 #   }
 #
-# Notes:
-#   • We *compute* κ, p½, residual/margins using elementfold.telemetry.measure.
-#   • If folds (ℱ) are present we also report predicted retention A≈e^(−2ℱ).
-#   • “z” is a simple *odds* proxy around the barrier: z = p½ / (1 − p½) (clamped).
-#   • All fields are optional; we degrade gracefully and keep the REPL alive.
+# Design goals:
+#   • Always say something useful (deterministic fallback is precise & safe).
+#   • When an LLM is available, keep it *anchored to numbers* and ask for
+#     concise, actionable coaching (no fluff, no risky moves near boundaries).
+#   • No heavy imports at file-top; optional LLM wrapper is lazy/guarded.
 #
-# MIT‑style tiny utility. © 2025 ElementFold authors.
+# © 2025 ElementFold authors. MIT-ish tiny utility.
 
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Tuple, List
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 import math
-import torch
+import re
 
-# Prefer absolute import for resilience inside the package.
-from elementfold.telemetry import measure as telemetry_measure
+# Optional LLM bridge (kept lazy and guarded). This file compiles without it.
+try:  # pragma: no cover
+    from .background_model import BackgroundModel, PilotConfig, as_messages  # type: ignore
+except Exception:  # pragma: no cover
+    BackgroundModel = None     # type: ignore
+    PilotConfig = None         # type: ignore
+
+    def as_messages(system: str, user: str) -> List[Dict[str, str]]:
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+Number = float
+DictStrAny = Dict[str, Any]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Small helpers (robust and side‑effect free)
+# Small helpers (sanitization, stats)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _as_tensor(x: Any, dtype=torch.float32) -> Optional[torch.Tensor]:
-    if x is None:
-        return None
+def _get_float(d: DictStrAny, *keys: str, default: Optional[float] = None) -> Optional[float]:
+    """Return the first finite float found among candidate keys, else default."""
+    for k in keys:
+        if k in d:
+            try:
+                v = float(d[k])
+                if math.isfinite(v):
+                    return v
+            except Exception:
+                pass
+    return default
+
+
+def _first_row_stats(x: Any) -> Dict[str, float]:
+    """
+    Accept a tensor-like or list-like 'folds' (B,T) or (T,) and return simple stats
+    on the first row: {'mean','max','last'}. Returns {} if parsing fails.
+    """
+    # Torch path (optional)
     try:
-        t = torch.as_tensor(x, dtype=dtype)
-        return t
+        import torch  # local import; may fail in stripped environments
+        if isinstance(x, torch.Tensor):
+            t = x.detach().cpu()
+            if t.dim() == 2:
+                t = t[0]
+            elif t.dim() != 1:
+                return {}
+            if t.numel() == 0:
+                return {}
+            return {
+                "mean": float(t.mean().item()),
+                "max": float(t.max().item()),
+                "last": float(t[-1].item()),
+            }
     except Exception:
-        return None
+        pass
 
-def _finite(x: Any, default: float = 0.0) -> float:
+    # Sequence path
     try:
-        v = float(x)
-        return v if math.isfinite(v) else default
+        seq = list(x[0]) if (x and isinstance(x[0], (list, tuple))) else list(x)
+        if not seq:
+            return {}
+        n = len(seq)
+        m = sum(float(v) for v in seq) / max(1, n)
+        mx = max(float(v) for v in seq)
+        return {"mean": float(m), "max": float(mx), "last": float(seq[-1])}
     except Exception:
-        return default
+        return {}
 
-def _safe_last_row_mean(t: Optional[torch.Tensor]) -> Optional[float]:
-    if t is None:
-        return None
-    if t.numel() == 0:
-        return None
-    # Mean over batch, take last position along T (end‑of‑sequence).
-    try:
-        return float(t[:, -1].mean().item())
-    except Exception:
-        try:
-            return float(t.flatten()[-1].item())
-        except Exception:
-            return None
 
-def _classify(value: Optional[float], *, good_lo=None, good_hi=None, warn_lo=None, warn_hi=None) -> str:
+def _grade_band(kappa: Optional[float], p_half: Optional[float], margin_min: Optional[float]) -> str:
     """
-    Simple 3‑light classifier:
-      • If value is None → 'unknown'
-      • If a numeric band (good_lo..good_hi) is supplied and value in band → 'good'
-      • Else if warn band supplied and value in band → 'warn'
-      • Else → 'risk'
+    Coarse UX “color” band (textual):
+      • "green"   — captured & safe
+      • "yellow"  — cautious
+      • "red"     — risky (near/over boundary)
     """
-    if value is None or not math.isfinite(value):
-        return "unknown"
-    if (good_lo is not None) and (good_hi is not None) and (good_lo <= value <= good_hi):
-        return "good"
-    if (warn_lo is not None) and (warn_hi is not None) and (warn_lo <= value <= warn_hi):
-        return "warn"
-    return "risk"
+    if kappa is None:
+        return "yellow"
+    if margin_min is not None and margin_min < 0.0:
+        return "red"
+    if p_half is not None and p_half > 0.30:
+        return "red"
+    if kappa > 0.85:
+        return "green"
+    if kappa > 0.65:
+        return "yellow"
+    return "red"
 
-def _nearness_to_barrier(p_half: Optional[float]) -> Optional[float]:
-    """0 = far from half‑step, 1 = right on it."""
-    if p_half is None:
-        return None
-    d = abs(0.5 - float(p_half))
-    return float(1.0 - min(max(d / 0.5, 0.0), 1.0))  # ∈ [0,1]
 
-def _odds(p: Optional[float], cap: float = 10.0) -> Optional[float]:
-    """z = p / (1 − p), clamped for comfort."""
-    if p is None:
-        return None
-    p = min(max(float(p), 1e-6), 1.0 - 1e-6)
-    return float(min(max(p / (1.0 - p), 0.0), cap))
-
-def _retention_from_folds(F: Optional[float]) -> Optional[float]:
-    """A ≈ e^(−2ℱ) — intuitive 'retention' proxy: 1 = unchanged, 0 → fully let go."""
-    if F is None:
-        return None
-    return float(math.exp(-2.0 * float(F)))
-
-def _fmt(x: Optional[float], nd: int = 3) -> str:
-    if x is None or not math.isfinite(x):
-        return "?"
-    return f"{x:.{nd}f}"
-
-def _combine_traffic(*labels: str) -> str:
+def _suggest_commands(
+    kappa: Optional[float],
+    p_half: Optional[float],
+    margin_min: Optional[float],
+    status: Optional[DictStrAny],
+) -> List[str]:
     """
-    Combine many lights into one conservative light,
-    where risk > warn > good > unknown.
+    Conservative adapter text commands for REPL/adapters.
     """
-    order = {"risk": 3, "warn": 2, "good": 1, "unknown": 0}
-    s = max((order.get(l, 0) for l in labels), default=0)
-    rev = {v: k for k, v in order.items()}
-    return rev.get(s, "unknown")
+    cmds: List[str] = []
+    phase = (status or {}).get("phase")
+
+    # Safety first
+    if margin_min is not None and margin_min < 0.0:
+        return ["hold", "tick 5"]
+
+    # Near boundary — stabilize gently
+    if p_half is not None and p_half > 0.30:
+        return ["hold", "tick 3"]
+
+    # Weak capture → probe slowly
+    if kappa is not None and kappa < 0.55:
+        return ["tick 3", "step up 1"]
+
+    # Well captured → short maintenance
+    if kappa is not None and kappa >= 0.85:
+        base = ["tick 2"]
+        if phase and str(phase).upper() != "CAPTURED":
+            base.append("hold")
+        return base
+
+    # Default
+    return ["tick 2"]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Core: interpret()
-# ──────────────────────────────────────────────────────────────────────────────
-
-def interpret(
-    X: Optional[torch.Tensor],
-    *,
-    delta: float,
-    folds: Optional[torch.Tensor] = None,
-    relax_meta: Optional[Dict[str, Any]] = None,
-    control: Optional[Dict[str, float]] = None,
-    rung: Optional[Dict[str, Any]] = None,
-    tele_hint: Optional[Dict[str, Any]] = None,
-    detail: bool = False,
-) -> Dict[str, Any]:
+def _deterministic_narrative(tele: DictStrAny, status: Optional[DictStrAny]) -> Tuple[str, List[str], float]:
     """
-    Convert raw signals into a friendly explanation + suggestions.
-
-    Returns a JSON‑friendly dict (see module header). Works with partial inputs.
+    Rules-only caption + bullets + confidence (0..1).
     """
-    # 0) Prepare inputs
-    X = _as_tensor(X, torch.float32)
-    F = _as_tensor(folds, torch.float32)
+    kappa = _get_float(tele, "kappa", "κ", default=None)
+    p_half = _get_float(tele, "p_half", "p½", default=None)
+    margin_min = _get_float(tele, "margin_min", default=None)
+    margin_mean = _get_float(tele, "margin_mean", default=None)
+    resid_std = _get_float(tele, "resid_std", default=None)
+    delta = _get_float(tele, "delta", "δ⋆", default=None)
 
-    # 1) Measure coherence on δ⋆ circle (robust to shapes / None)
-    tele: Dict[str, Any]
-    if X is not None:
-        tele = telemetry_measure(X, float(delta), detail=detail)
+    band = _grade_band(kappa, p_half, margin_min)
+
+    # Caption (one line, quick signal)
+    if isinstance(kappa, float):
+        marker = "✓" if band == "green" else ("!" if band == "red" else "•")
+        caption = f"{marker} κ={kappa:.3f}"
     else:
-        # Fall back to whatever hints we got (or empty defaults).
-        tele = {
-            "kappa": _finite((tele_hint or {}).get("kappa"), 0.0),
-            "p_half": _finite((tele_hint or {}).get("p_half"), 0.0),
-            "margin_mean": _finite((tele_hint or {}).get("margin_mean"), 0.0),
-            "margin_min": _finite((tele_hint or {}).get("margin_min"), 0.0),
-            "resid_std": _finite((tele_hint or {}).get("resid_std"), 0.0),
-            "phase_mean": _finite((tele_hint or {}).get("phase_mean"), 0.0),
-            "delta": float(delta),
-        }
+        caption = "• assessing coherence"
 
-    kappa = float(tele.get("kappa", 0.0))
-    p_half = float(tele.get("p_half", 0.0))
-    margin_min = float(tele.get("margin_min", 0.0))
-    resid_std = float(tele.get("resid_std", 0.0))
-    phase_mean = float(tele.get("phase_mean", 0.0))
-    delta_used = float(tele.get("delta", delta))
-
-    # 2) Derived proxies
-    near = _nearness_to_barrier(p_half)               # 0..1
-    z = _odds(p_half)                                 # odds near barrier
-    F_last = _safe_last_row_mean(F)                   # scalar or None
-    A = _retention_from_folds(F_last)                 # predicted retention
-
-    # 3) Traffic lights (simple but sensible defaults)
-    #    • Coherence (κ): good ≥0.75, warn ≥0.45 else risk.
-    #    • Barrier (nearness): good ≤0.25, warn ≤0.55, risk otherwise.
-    #    • Stability from residual spread (vs. half‑delta).
-    #    • Pace from mean Δℱ (if folds present).
-    coh_light = _classify(kappa, good_lo=0.75, good_hi=1.0, warn_lo=0.45, warn_hi=0.75)
-    bar_light = _classify(near, good_lo=0.0, good_hi=0.25, warn_lo=0.25, warn_hi=0.55)
-
-    half = delta_used * 0.5
-    resid_norm = resid_std / max(half, 1e-9) if math.isfinite(half) else float("inf")
-    stab_light = _classify(resid_norm, good_lo=0.0, good_hi=0.20, warn_lo=0.20, warn_hi=0.40)
-
-    pace_light = "unknown"
-    if F is not None and F.numel() > 1:
-        dF = F[:, 1:] - F[:, :-1]
-        pace = float(dF.mean().item())
-        pace_light = _classify(pace, good_lo=0.0, good_hi=0.05, warn_lo=0.05, warn_hi=0.15)
-
-    # 4) Rung FSM state (if provided)
-    intent = str((rung or {}).get("intent", "stabilize"))
-    phase = str((rung or {}).get("phase", "?"))
-    dwell = int((rung or {}).get("dwell", 0))
-    band = float((rung or {}).get("band", delta_used / 6.0))
-
-    # 5) Control knobs (if provided)
-    beta = _finite((control or {}).get("beta"), float("nan"))
-    gamma = _finite((control or {}).get("gamma"), float("nan"))
-    clamp = _finite((control or {}).get("clamp"), float("nan"))
-
-    # 6) Relaxation meta (safe echoes)
-    relax = dict(relax_meta or {})
-    eta = _finite(relax.get("eta"), 0.0)
-    lam = _finite(relax.get("lambda"), 0.0)
-    D   = _finite(relax.get("D"), 0.0)
-    rho = _finite(relax.get("rho"), 0.0)
-    dt  = _finite(relax.get("dt"), 1.0)
-    steps = int(relax.get("steps", 1))
-
-    # 7) Build sentences (non‑expert, terse + precise)
-    lines: List[str] = []
-    # Coherence
-    if coh_light == "good":
-        lines.append(f"• κ={_fmt(kappa)} — strong phase alignment (good).")
-    elif coh_light == "warn":
-        lines.append(f"• κ={_fmt(kappa)} — moderate alignment; consider HOLD to center.")
-    else:
-        lines.append(f"• κ={_fmt(kappa)} — weak alignment (risk); use HOLD or lower β / raise γ to settle.")
-
-    # Barrier
-    if near is not None:
-        if bar_light == "good":
-            lines.append(f"• p½={_fmt(p_half)} — far from the boundary (good).")
-        elif bar_light == "warn":
-            lines.append(f"• p½={_fmt(p_half)} — somewhat near the boundary; raise γ if chatter appears.")
+    # Bullets (one fact per line)
+    bullets: List[str] = []
+    if kappa is not None:
+        if kappa >= 0.85:
+            bullets.append("phase alignment strong (captured)")
+        elif kappa >= 0.65:
+            bullets.append("phase moderately aligned (watch drift)")
         else:
-            lines.append(f"• p½={_fmt(p_half)} — at/near the half‑step (risk); step or damp before continuing.")
-    else:
-        lines.append("• p½=? — barrier proximity unknown (no ledger).")
+            bullets.append("phase weak — consider probing or holding")
 
-    # Residuals / margins
-    if math.isfinite(margin_min):
+    if p_half is not None:
+        if p_half > 0.30:
+            bullets.append(f"near half‑click boundary (p½={p_half:.2f}) — risk of rung flip")
+        elif p_half > 0.10:
+            bullets.append(f"some proximity to boundary (p½={p_half:.2f})")
+        else:
+            bullets.append("safe margin from boundary")
+
+    if margin_min is not None:
         if margin_min < 0.0:
-            lines.append(f"• margin_min={_fmt(margin_min)} — already over the line; capture a rung.")
-        else:
-            lines.append(f"• margin_min={_fmt(margin_min)} — safety gap to boundary (higher is safer).")
+            bullets.append(f"margin_min={margin_min:.4f} — already over the line; hold & damp")
+        elif margin_mean is not None:
+            bullets.append(f"safety gap ~{margin_mean:.4f} (min {margin_min:.4f})")
 
-    if math.isfinite(resid_std):
-        lines.append(f"• resid_std={_fmt(resid_std)} — residual spread within a click (lower is calmer).")
+    if resid_std is not None:
+        bullets.append(f"residual spread σ≈{resid_std:.4f} (narrower is calmer)")
 
-    # Relaxation
-    if F_last is not None:
-        lines.append(f"• ℱ={_fmt(F_last)} — accumulation of sharing/steps so far.")
-        if A is not None:
-            lines.append(f"• A≈e^(−2ℱ)={_fmt(A)} — predicted retention; smaller A → stronger letting‑go.")
-    if any(v > 0 for v in (eta, lam, D, rho)):
-        lines.append(
-            "• relax: "
-            + ", ".join([
-                f"η={_fmt(eta,3)}",
-                f"λ={_fmt(lam,3)}",
-                f"D={_fmt(D,3)}",
-                f"ρ={_fmt(rho,3)}",
-                f"dt={_fmt(dt,3)}×{steps}",
-            ])
-            + " — diffusion/decay is active."
-        )
+    if delta is not None:
+        bullets.append(f"δ⋆={delta:g} (click size)")
 
-    # Control summary
-    if math.isfinite(beta) or math.isfinite(gamma) or math.isfinite(clamp):
-        btxt = f"β={_fmt(beta,2)}" if math.isfinite(beta) else "β=?"
-        gtxt = f"γ={_fmt(gamma,2)}" if math.isfinite(gamma) else "γ=?"
-        ctxt = f"⛔={_fmt(clamp,1)}" if math.isfinite(clamp) else "⛔=?"
-        lines.append(f"• control: {btxt}  {gtxt}  {ctxt}.")
+    if status:
+        ph = status.get("phase")
+        it = status.get("intent")
+        if ph:
+            bullets.append(f"controller phase: {ph}")
+        if it:
+            bullets.append(f"controller intent: {it}")
 
-    # FSM and acceptance band
-    lines.append(f"• rung: intent={intent}, phase={phase}, dwell={dwell}, band≈{_fmt(band)}.")
+    # Confidence heuristic: rise with kappa, shrink with boundary risk
+    conf = 0.5
+    if isinstance(kappa, float):
+        conf = 0.4 + 0.6 * max(0.0, min(1.0, kappa))
+    if isinstance(p_half, float):
+        conf *= max(0.2, 1.0 - 0.7 * max(0.0, min(1.0, p_half)))
+    if isinstance(margin_min, float) and margin_min < 0.0:
+        conf *= 0.6
 
-    # 8) Suggestions (context‑aware; short, concrete)
-    next_actions: List[str] = []
-    # Coherence guidance
-    if coh_light == "risk":
-        next_actions.append("Use HOLD to recenter; if still noisy, increase γ slightly (e.g., +0.1).")
-    elif coh_light == "warn":
-        next_actions.append("If response feels loose, try a short HOLD, then SEEK one rung.")
-    # Barrier guidance
-    if bar_light == "risk":
-        next_actions.append("You are on the ridge: either step up/down or raise γ to avoid teetering.")
-    # Pace
-    if pace_light == "warn":
-        next_actions.append("Relaxation is ramping: consider lowering η or ρ to slow temperature lift.")
-    # Margin guidance
-    if margin_min < 0.0:
-        next_actions.append("Margin < 0: complete capture before further steps (stay in CAPTURE until κ increases).")
-    # Generic rung usage
-    if intent.lower() != "hold" and bar_light in {"warn", "risk"}:
-        next_actions.append("Plan: HOLD → tick 3, then SEEK toward target rung when κ stabilizes.")
+    return caption, bullets, float(max(0.05, min(0.98, conf)))
 
-    # 9) Caption + headline (for Studio / UI badges)
-    badges = {
-        "F": (None if F_last is None else float(F_last)),
-        "z": (None if z is None else float(z)),
-        "A": (None if A is None else float(A)),
-    }
 
-    # Friendly caption tying control + quick qualitative state
-    qual = []
-    if coh_light == "good":
-        qual.append("coherent")
-    elif coh_light == "warn":
-        qual.append("moderate")
-    else:
-        qual.append("noisy")
+# ──────────────────────────────────────────────────────────────────────────────
+# Interpreter
+# ──────────────────────────────────────────────────────────────────────────────
 
-    if bar_light == "good":
-        qual.append("far from barrier")
-    elif bar_light == "warn":
-        qual.append("near barrier")
-    else:
-        qual.append("on barrier")
-
-    caption = (
-        f"β={_fmt(beta,2)}  γ={_fmt(gamma,2)}  ⛔={_fmt(clamp,1)}"
-        f"  |  {', '.join(qual)}"
+@dataclass
+class InterpreterConfig:
+    enable_llm: bool = True
+    max_new_tokens: int = 160
+    temperature: float = 0.2
+    top_p: float = 0.9
+    top_k: int = 0
+    system_prompt: str = (
+        "You are ElementFold Co‑Pilot. You see live telemetry on a δ⋆ rung ladder. "
+        "Explain numbers precisely, avoid jargon, and propose next adapter commands "
+        "like ['hold','tick 3','step up 1'] when safe. ≤6 bullets; be conservative near boundaries."
     )
 
-    # Headline with badges the UI can parse (ℱ / z / A tokens are deliberate)
-    intent_tag = phase if phase != "?" else intent.upper()
-    parts = [intent_tag]
-    parts.append(f"κ={_fmt(kappa,2)}")
-    parts.append(f"p½={_fmt(p_half,2)}")
-    if F_last is not None:
-        parts.append(f"ℱ={_fmt(F_last,3)}")
-    if z is not None:
-        parts.append(f"z={_fmt(z,2)}")
-    if A is not None:
-        parts.append(f"A≈e^(−2ℱ)={_fmt(A,2)}")
-    headline = " • ".join(parts)
 
-    # 10) Metrics table (each with value + plain‑English meaning)
-    metrics: Dict[str, Dict[str, Any]] = {
-        "kappa": {
-            "value": float(kappa),
-            "meaning": "phase alignment on δ⋆ circle (1 = tight, 0 = spread)",
-            "light": coh_light,
-            "range_hint": "[0..1] higher is better",
-        },
-        "p_half": {
-            "value": float(p_half),
-            "meaning": "fraction near the half‑step boundary (0 = safe center, 0.5 = ridge)",
-            "light": bar_light,
-            "range_hint": "[0..1] lower is safer",
-        },
-        "margin_min": {
-            "value": float(margin_min),
-            "meaning": "closest distance to boundary in X (negative means already over)",
-            "light": ("risk" if margin_min < 0 else "good"),
-            "range_hint": "≥ 0 preferred",
-        },
-        "resid_std": {
-            "value": float(resid_std),
-            "meaning": "spread of residuals inside a click (smaller is calmer)",
-            "light": stab_light,
-            "range_hint": f"~0..{_fmt(0.5*delta_used)} (relative to δ⋆/2)",
-        },
-        "phase_mean": {
-            "value": float(phase_mean),
-            "meaning": "average location in X modulo δ⋆",
-            "light": "unknown",
-            "range_hint": f"[0..{_fmt(delta_used)}), informational",
-        },
-        "delta": {
-            "value": float(delta_used),
-            "meaning": "click size δ⋆",
-            "light": "unknown",
-            "range_hint": "model/driver setting",
-        },
-        "F_last": {
-            "value": (None if F_last is None else float(F_last)),
-            "meaning": "cumulative fold counter at sequence end",
-            "light": pace_light if F_last is not None else "unknown",
-            "range_hint": "grows with distance/effort",
-        },
-        "A_retention": {
-            "value": (None if A is None else float(A)),
-            "meaning": "predicted retention A≈e^(−2ℱ) (1=unchanged, 0=let go)",
-            "light": "unknown" if A is None else ("good" if A >= 0.6 else ("warn" if A >= 0.3 else "risk")),
-            "range_hint": "[0..1]",
-        },
-        "odds_z": {
-            "value": (None if z is None else float(z)),
-            "meaning": "odds proxy near barrier: p½/(1−p½)",
-            "light": bar_light,
-            "range_hint": "≈1 at ridge, ↓ when centered",
-        },
-    }
+class TelemetryInterpreter:
+    """
+    Bridge from raw telemetry → human narrative (+ suggested commands).
+    Uses a BackgroundModel (LLM) when healthy; falls back to deterministic rules.
+    """
+    def __init__(self, pilot: Any = None, cfg: Optional[InterpreterConfig] = None):
+        self.cfg = cfg or InterpreterConfig()
+        self._pilot = pilot  # may be None (then we always fall back)
 
-    # 11) Traffic roll‑up (conservative)
-    traffic = {
-        "coherence": coh_light,
-        "barrier": bar_light,
-        "stability": stab_light,
-        "pace": pace_light,
-        "overall": _combine_traffic(coh_light, bar_light, stab_light, pace_light),
-    }
+    def summarize(
+        self,
+        telemetry: DictStrAny,
+        *,
+        status: Optional[DictStrAny] = None,
+        context: Optional[DictStrAny] = None,
+    ) -> DictStrAny:
+        # 1) Extract cleaned numbers
+        kappa = _get_float(telemetry, "kappa", "κ")
+        p_half = _get_float(telemetry, "p_half", "p½")
+        margin_min = _get_float(telemetry, "margin_min")
+        margin_mean = _get_float(telemetry, "margin_mean")
+        resid_std = _get_float(telemetry, "resid_std")
+        delta = _get_float(telemetry, "delta", "δ⋆")
+        folds_stats = _first_row_stats(telemetry.get("folds")) if telemetry.get("folds", None) is not None else {}
 
-    return {
-        "headline": headline,
-        "caption": caption,
-        "badges": badges,
-        "traffic": traffic,
-        "metrics": metrics,
-        "next": next_actions,
-        "lines": lines,
-        # Echoes (handy for UIs that want raw state)
-        "rung": {"intent": intent, "phase": phase, "dwell": dwell, "band": band},
-        "relax": {"eta": eta, "lambda": lam, "D": D, "rho": rho, "dt": dt, "steps": steps},
-    }
+        # 2) Deterministic baseline
+        cap0, bullets0, conf0 = _deterministic_narrative(telemetry, status)
+        next0 = _suggest_commands(kappa, p_half, margin_min, status)
+
+        # 3) If LLM disabled or not ready, return baseline
+        pilot_ready = bool(self._pilot and hasattr(self._pilot, "ready") and self._pilot.ready())
+        if (not self.cfg.enable_llm) or (not pilot_ready):
+            return {
+                "caption": cap0,
+                "bullets": bullets0,
+                "next_actions": next0,
+                "numbers": {
+                    "kappa": kappa, "p_half": p_half, "margin_min": margin_min, "margin_mean": margin_mean,
+                    "resid_std": resid_std, "delta": delta, "folds_stats": folds_stats or None
+                },
+                "confidence": conf0,
+                "llm_used": False,
+            }
+
+        # 4) Build an anchored chat prompt for the LLM (facts first)
+        lines = []
+        def add(k: str, v: Optional[float]):
+            if isinstance(v, float):
+                lines.append(f"{k}={v:.6g}")
+
+        add("kappa", kappa); add("p_half", p_half); add("margin_min", margin_min); add("margin_mean", margin_mean)
+        add("resid_std", resid_std); add("delta", delta)
+        if folds_stats:
+            add("folds.mean", folds_stats.get("mean"))
+            add("folds.max", folds_stats.get("max"))
+            add("folds.last", folds_stats.get("last"))
+
+        if status:
+            ph = status.get("phase"); it = status.get("intent"); kt = status.get("k_target", status.get("target_k"))
+            if ph: lines.append(f"controller.phase={ph}")
+            if it: lines.append(f"controller.intent={it}")
+            if kt is not None: lines.append(f"controller.k_target={kt}")
+
+        if context:
+            for k, v in context.items():
+                try:
+                    lines.append(f"{k}={v}")
+                except Exception:
+                    pass
+
+        facts_block = "\n".join(lines) if lines else "(no metrics)"
+        baseline_block = "\n".join(["# baseline.caption", cap0, "# baseline.actions", *next0])
+
+        user_prompt = f"""\
+Here are live metrics (one per line):
+{facts_block}
+
+Provide:
+1) A one-line status starting with ✓ / • / ! and include kappa/p_half if known.
+2) 3–6 short bullets, each interpreting exactly one numeric fact (no fluff).
+3) A JSON array of 2–4 *safe* next text commands for the adapter (e.g., ["hold","tick 3"]).
+
+Constraints:
+- Be conservative near boundaries (p_half>0.3 or margin_min<0).
+- Prefer 'hold' + short 'tick N' for stabilization; only suggest 'step up|down' when clearly safe.
+- Keep technical terms parenthesized; make it human-readable.
+- If uncertain, say 'uncertain' and fall back to baseline.
+
+Baseline (for reference):
+{baseline_block}
+"""
+
+        # 5) Query the LLM
+        try:
+            msgs = as_messages(system=self.cfg.system_prompt, user=user_prompt)
+            comp = self._pilot.generate(  # type: ignore[attr-defined]
+                msgs,
+                max_new_tokens=self.cfg.max_new_tokens,
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
+                top_k=self.cfg.top_k,
+            )
+            raw = (comp.text or "").strip()
+            suggested = _extract_json_commands(raw) or next0
+            caption = _extract_first_line(raw) or cap0
+            bullets = _extract_bullets(raw) or bullets0
+
+            return {
+                "caption": caption,
+                "bullets": bullets,
+                "next_actions": suggested[:4],
+                "numbers": {
+                    "kappa": kappa, "p_half": p_half, "margin_min": margin_min, "margin_mean": margin_mean,
+                    "resid_std": resid_std, "delta": delta, "folds_stats": folds_stats or None
+                },
+                "confidence": max(conf0, 0.7),
+                "llm_used": True,
+                "raw_llm": raw,
+                "llm_meta": {
+                    "backend": getattr(comp, "backend", None),
+                    "latency_ms": getattr(comp, "latency_ms", None),
+                },
+            }
+        except Exception:
+            # Graceful fallback if anything goes wrong upstream
+            return {
+                "caption": cap0,
+                "bullets": bullets0,
+                "next_actions": next0,
+                "numbers": {
+                    "kappa": kappa, "p_half": p_half, "margin_min": margin_min, "margin_mean": margin_mean,
+                    "resid_std": resid_std, "delta": delta, "folds_stats": folds_stats or None
+                },
+                "confidence": conf0,
+                "llm_used": False,
+            }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Convenience: compact status lines for Studio (optional)
+# Tiny, robust extractors (tolerant to loosely formatted LLM output)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def format_status_block(state: Dict[str, Any]) -> str:
+def _extract_first_line(text: str) -> Optional[str]:
+    for line in text.splitlines():
+        s = line.strip()
+        if s:
+            return s
+    return None
+
+
+def _extract_bullets(text: str) -> List[str]:
     """
-    Render a compact status block from interpret(...) output.
-    Safe for REPL printing; no colors (Studio prints its own gauges).
+    Collect up to 6 bullet-ish lines. Accepts '-', '•', or '1.'/'1)' markers.
     """
-    h = state.get("headline", "")
-    cap = state.get("caption", "")
-    traffic = state.get("traffic", {})
-    overall = traffic.get("overall", "unknown")
-    nxt = state.get("next", [])[:2]  # keep short
-    nx = (" • ".join(nxt)) if nxt else ""
-    tail = f"\n↳ next: {nx}" if nx else ""
-    return f"{h}\n{cap}\ntraffic={overall}{tail}"
+    bullets: List[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("-") or s.startswith("•") or re.match(r"^\d+[\.\)]\s+", s):
+            s = re.sub(r"^(\-|\•|\d+[\.\)])\s*", "", s).strip()
+            if s:
+                bullets.append(s)
+        if len(bullets) >= 6:
+            break
+    return bullets
+
+
+def _extract_json_commands(text: str) -> Optional[List[str]]:
+    """
+    Find the first JSON array of strings in the text (e.g., ["hold","tick 3"]).
+    """
+    try:
+        import json
+        m = re.search(r"\[[^\]]+\]", text, flags=re.S)
+        if not m:
+            return None
+        arr = json.loads(m.group(0))
+        if isinstance(arr, list) and all(isinstance(x, str) for x in arr):
+            out = [s.strip().lower() for s in arr if isinstance(s, str) and s.strip()]
+            return out or None
+        return None
+    except Exception:
+        return None
