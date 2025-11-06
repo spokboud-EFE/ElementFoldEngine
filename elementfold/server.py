@@ -5,11 +5,12 @@
 #   • GET    /favicon.ico       → 204 (silence browser noise)
 #   • GET    /health            → HealthResponse
 #   • GET    /config            → engine/config snapshot
-#   • GET    /adapters[?reload=1]
-#                               → {"adapters": ["language","audio","multimodal", ...]}
-#   • GET    /telemetry[?n=200] → recent console lines (mirror of utils.display.recent_json)
+#   • GET    /adapters          → {"adapters": ["language","audio","multimodal", ...]}
+#   • GET    /telemetry         → recent console lines (mirror of utils.display.recent_json)
+#   • GET    /telemetry/state   → one live telemetry snapshot (does a tiny infer with relax)
+#   • GET    /telemetry/counsel → interpreter summary (numbers → narrative + next actions)
 #   • GET    /pilot/health      → BackgroundModel health (local + remote), if available
-#   • POST   /pilot/generate    → BackgroundModel.generate(messages|system/user|prompt)
+#   • POST   /pilot/generate    → BackgroundModel.generate(messages=...) with fallback
 #   • POST   /infer             → InferResponse (tokens/ledger[/text][+folds][+relax_meta])
 #   • POST   /steer             → SteerResponse (adapter output [+ applied params])
 #   • POST   /train             → TrainResponse (run a short training loop)
@@ -18,15 +19,8 @@
 #   1) Lazy engine: first request boots the Engine; first infer/steer may train.
 #   2) Thread‑safe: module‑level locks guard singletons.
 #   3) Robust JSON: payloads are validated/coerced; errors are structured.
-#   4) CORS: permissive defaults; OPTIONS supported; JSON responses are no‑store.
+#   4) CORS: permissive defaults; OPTIONS supported.
 #   5) No external deps: stdlib http.server + tiny server_api helpers.
-#
-# New in this iteration:
-#   • Adapters hot‑reload via GET /adapters?reload=1 (if registry available).
-#   • /telemetry uses the same JSON sanitizer (to_json) as other endpoints.
-#   • /pilot/generate also accepts {"prompt": "..."} for quick calls.
-#   • /pilot/health includes 'prefer_remote' for UI routing hints.
-#   • All JSON responses send Cache-Control: no-store.
 
 from __future__ import annotations
 
@@ -45,11 +39,18 @@ from dataclasses import asdict
 import json
 import torch
 import sys
+import time
 
 from . import __version__
 from .runtime import Engine
 from .tokenizer import SimpleTokenizer
-from .utils.bootstrap import bootstrap_brain_env
+
+# Optional brain bootstrap (ram‑only env). If missing, we silently skip.
+try:
+    from .utils.bootstrap import bootstrap_brain_env  # type: ignore
+except Exception:  # pragma: no cover
+    def bootstrap_brain_env(*_, **__):  # type: ignore
+        return None
 
 # API schemas + JSON helpers
 from .server_api import (
@@ -71,26 +72,34 @@ from .server_api import (
 # Optional: adapter list for /adapters endpoint
 try:
     from .experience.adapters.base import AdapterRegistry
-except Exception:
+except Exception:  # pragma: no cover
     AdapterRegistry = None  # graceful degrade if not importable
 
 # Telemetry mirror (console → web)
 try:
     from .utils.display import recent_json
-except Exception:
+except Exception:  # pragma: no cover
     def recent_json(n: int = 200):
         return []
 
 # Optional: BackgroundModel (pilot LLM). Import lazily/optionally.
 try:
     from .experience.background_model import BackgroundModel, PilotConfig, as_messages
-except Exception:
+except Exception:  # pragma: no cover
     BackgroundModel = None     # type: ignore
     PilotConfig = None         # type: ignore
     as_messages = None         # type: ignore
 
+# Telemetry Interpreter (numbers → narrative)
+try:
+    from .experience.interpreter import TelemetryInterpreter, InterpreterConfig
+except Exception:  # pragma: no cover
+    TelemetryInterpreter = None  # type: ignore
+    InterpreterConfig = None     # type: ignore
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Lazy singletons (Engine and Pilot), protected by small locks
+# Lazy singletons (Engine, Pilot, Interpreter), protected by small locks
 # ──────────────────────────────────────────────────────────────────────────────
 
 _ENGINE_LOCK = threading.Lock()
@@ -108,25 +117,6 @@ _PILOT_LOCK = threading.Lock()
 _PILOT: "BackgroundModel | None" = None
 
 def _pilot_config_from_env() -> "PilotConfig":
-    """
-    Build PilotConfig from environment variables (all optional).
-    Recognized envs (examples):
-      PILOT_LOCAL_KIND=transformers|llama_cpp|ollama
-      PILOT_LOCAL_MODEL=tinyllama/TinyLlama-1.1B-Chat-v1.0
-      PILOT_LOCAL_DEVICE=cuda:0
-      PILOT_LOCAL_OLLAMA_URL=http://localhost:11434
-      PILOT_REMOTE_KIND=openai|ollama
-      PILOT_REMOTE_URL=http://10.0.0.101:11434
-      PILOT_REMOTE_MODEL=llama3:8b-instruct
-      PILOT_REMOTE_API_KEY=sk-...
-      PILOT_PREFER_REMOTE=1
-      PILOT_TEMPERATURE=0.2
-      PILOT_TOP_P=0.9
-      PILOT_TOP_K=0
-      PILOT_MAX_NEW=256
-      PILOT_HEARTBEAT_S=10
-      PILOT_TIMEOUT_S=60
-    """
     if PilotConfig is None:
         raise RuntimeError("BackgroundModel not available (import failed)")
 
@@ -139,19 +129,13 @@ def _pilot_config_from_env() -> "PilotConfig":
     cfg.local_kind = (_get("PILOT_LOCAL_KIND", cfg.local_kind) or cfg.local_kind)  # type: ignore
     cfg.local_model = (_get("PILOT_LOCAL_MODEL", cfg.local_model) or cfg.local_model)  # type: ignore
     cfg.local_device = _get("PILOT_LOCAL_DEVICE", cfg.local_device or None)
-    try:
-        # Local Ollama URL only relevant when local_kind == "ollama"
-        cfg.local_ollama_url = _get("PILOT_LOCAL_OLLAMA_URL", cfg.local_ollama_url) or cfg.local_ollama_url
-    except Exception:
-        pass
-
+    cfg.local_ollama_url = _get("PILOT_LOCAL_OLLAMA_URL", cfg.local_ollama_url) or cfg.local_ollama_url
     # Remote
     rk = _get("PILOT_REMOTE_KIND", cfg.remote_kind or "")
     cfg.remote_kind = rk if rk else None  # type: ignore
     cfg.remote_url = _get("PILOT_REMOTE_URL", cfg.remote_url or None)
     cfg.remote_model = _get("PILOT_REMOTE_MODEL", cfg.remote_model or None)
     cfg.remote_api_key = _get("PILOT_REMOTE_API_KEY", cfg.remote_api_key or None)
-
     # Decoding + limits
     try: cfg.temperature = float(_get("PILOT_TEMPERATURE", str(cfg.temperature)) or cfg.temperature)
     except Exception: pass
@@ -161,17 +145,15 @@ def _pilot_config_from_env() -> "PilotConfig":
     except Exception: pass
     try: cfg.max_new_tokens = int(_get("PILOT_MAX_NEW", str(cfg.max_new_tokens)) or cfg.max_new_tokens)
     except Exception: pass
-
     # Heartbeat + request timeouts
     try: cfg.heartbeat_every_s = float(_get("PILOT_HEARTBEAT_S", str(cfg.heartbeat_every_s)) or cfg.heartbeat_every_s)
     except Exception: pass
     try: cfg.request_timeout_s = float(_get("PILOT_TIMEOUT_S", str(cfg.request_timeout_s)) or cfg.request_timeout_s)
     except Exception: pass
-
     # Prefer remote
     pr = _get("PILOT_PREFER_REMOTE")
     if pr is not None:
-        cfg.prefer_remote = pr.strip().lower() not in {"0", "false", ""}
+        cfg.prefer_remote = pr.strip() not in {"0", "false", "False", ""}
 
     return cfg
 
@@ -185,6 +167,27 @@ def _pilot() -> "BackgroundModel":
             cfg = _pilot_config_from_env()
             _PILOT = BackgroundModel(cfg)
         return _PILOT
+
+_INTERP_LOCK = threading.Lock()
+_INTERP: "TelemetryInterpreter | None" = None
+
+def _interpreter() -> "TelemetryInterpreter":
+    """Create/fetch a TelemetryInterpreter (numbers→narrative)."""
+    if TelemetryInterpreter is None:
+        raise RuntimeError("TelemetryInterpreter not available (module import failed)")
+    global _INTERP
+    with _INTERP_LOCK:
+        if _INTERP is None:
+            pilot = None
+            if BackgroundModel is not None:
+                try:
+                    pilot = _pilot()
+                except Exception:
+                    pilot = None
+            cfg = InterpreterConfig(enable_llm=bool(pilot))
+            _INTERP = TelemetryInterpreter(pilot=pilot, cfg=cfg)
+        return _INTERP
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Small HTML index (human friendly)
@@ -214,7 +217,9 @@ _INDEX_HTML = """<!doctype html>
     <span class="chip get">GET</span> <a href="/health">/health</a><br>
     <span class="chip get">GET</span> <a href="/config">/config</a><br>
     <span class="chip get">GET</span> <a href="/adapters">/adapters</a><br>
-    <span class="chip get">GET</span> <a href="/telemetry?n=200">/telemetry?n=200</a><br>
+    <span class="chip get">GET</span> <a href="/telemetry?n=200">/telemetry</a><br>
+    <span class="chip get">GET</span> <a href="/telemetry/state">/telemetry/state</a><br>
+    <span class="chip get">GET</span> <a href="/telemetry/counsel">/telemetry/counsel</a><br>
     <span class="chip get">GET</span> <a href="/pilot/health">/pilot/health</a><br>
     <span class="chip post">POST</span> <code>/pilot/generate</code><br>
     <span class="chip post">POST</span> <code>/infer</code><br>
@@ -241,6 +246,94 @@ _INDEX_HTML = """<!doctype html>
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Defaults for quick telemetry snapshots
+# ──────────────────────────────────────────────────────────────────────────────
+
+_DEFAULT_RELAX = {
+    "eta": 0.02,
+    "eta_path_weight": 0.5,
+    "rho": 0.20,
+    "lambda": 0.0,
+    "D": 0.05,
+    "phi_inf": 0.0,
+    "steps": 1,
+    "dt": 1.0,
+}
+
+def _first_row_list(x) -> list:
+    """
+    Tensor/list → python list; for 2‑D we take the first row.
+    """
+    # torch path
+    try:
+        import torch as _t
+        if isinstance(x, _t.Tensor):
+            t = x.detach().cpu()
+            if t.dim() == 2:
+                return t[0].tolist()
+            return t.tolist()
+    except Exception:
+        pass
+    # generic
+    try:
+        arr = x.tolist()
+        return arr[0] if (arr and isinstance(arr[0], (list, tuple))) else arr
+    except Exception:
+        pass
+    if isinstance(x, (list, tuple)):
+        return list(x[0]) if (x and isinstance(x[0], (list, tuple))) else list(x)
+    return []
+
+def _quick_state_snapshot(eng: Engine) -> dict:
+    """
+    Produce a small, self‑contained telemetry dict by running a tiny greedy infer
+    with relax enabled. This keeps /telemetry/state and /telemetry/counsel simple
+    without requiring Engine.telemetry().
+    """
+    # Ensure model exists (may train on first call)
+    if eng.model is None:
+        _ = eng.infer(x=None)
+
+    out = eng.infer(
+        x=None,  # random quick batch
+        strategy="greedy",
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        relax=_DEFAULT_RELAX,
+    )
+
+    tele: dict = {
+        "delta": float(getattr(eng.cfg, "delta", 0.0)),
+    }
+
+    # folds + relax_meta, if present
+    if "folds" in out:
+        tele["folds"] = _first_row_list(out["folds"])
+    if "relax_meta" in out and isinstance(out["relax_meta"], dict):
+        tele["relax_meta"] = out["relax_meta"]
+
+    # Simple motion proxy from ledger (optional)
+    try:
+        import numpy as _np
+        L = _first_row_list(out.get("ledger", []))
+        if len(L) >= 3:
+            d1 = _np.diff(_np.array(L, dtype="float64"))
+            tele["resid_std"] = float(max(0.0, float(_np.std(d1))))
+    except Exception:
+        pass
+
+    # Placeholders for advanced metrics (adapters may fill these later)
+    tele["kappa"] = None
+    tele["p_half"] = None
+    tele["margin_min"] = None
+    tele["margin_mean"] = None
+    tele["phase_mean"] = None
+
+    return tele
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # HTTP handler (one instance per request)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -251,8 +344,7 @@ class Handler(BaseHTTPRequestHandler):
         # Permissive CORS for quick experiments (can be tightened if needed).
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _send_json(self, status: int, payload) -> None:
         """Serialize payload as JSON and send with common headers."""
@@ -260,7 +352,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self._set_cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("X-ElementFold-Version", str(__version__))
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -275,7 +366,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self._set_cors()
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("X-ElementFold-Version", str(__version__))
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -310,7 +400,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_html(200, html)
 
             if path == "/favicon.ico":
-                # Silence browser requests; no favicon served.
                 self.send_response(204)
                 self._set_cors()
                 self.end_headers()
@@ -341,26 +430,45 @@ class Handler(BaseHTTPRequestHandler):
                 names = []
                 try:
                     if AdapterRegistry is not None:
-                        if q.get("reload", ["0"])[0] in {"1", "true", "yes"}:
-                            # Best‑effort re‑import (each adapter module self‑registers on import)
-                            try:
-                                from .experience import adapters as _admod  # noqa: F401
-                            except Exception:
-                                pass
                         names = list(AdapterRegistry.names())
                 except Exception:
                     names = []
                 return self._send_json(200, {"adapters": names})
 
             if path == "/telemetry":
-                # Mirror the console: recent lines, newest last.
                 try:
                     n = int(q.get("n", ["200"])[0])
                 except Exception:
                     n = 200
                 n = max(1, min(2000, n))
                 logs = recent_json(n)
-                return self._send_json(200, {"lines": logs})
+                self.send_response(200)
+                self._set_cors()
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                body = json.dumps({"lines": logs}).encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if path == "/telemetry/state":
+                eng = _engine()
+                tele = _quick_state_snapshot(eng)
+                return self._send_json(200, {"telemetry": tele, "ts": time.time()})
+
+            if path == "/telemetry/counsel":
+                if TelemetryInterpreter is None:
+                    return self._send_error(501, code="interpreter_unavailable",
+                                            message="TelemetryInterpreter not available (module import failed)")
+                eng = _engine()
+                tele = _quick_state_snapshot(eng)
+                try:
+                    interp = _interpreter()
+                except Exception as e:
+                    # If we cannot init interpreter with pilot, fall back to rules‑only instance
+                    interp = TelemetryInterpreter(pilot=None, cfg=InterpreterConfig(enable_llm=False))  # type: ignore
+                out = interp.summarize(telemetry=tele, status=None, context=None)
+                return self._send_json(200, out)
 
             if path == "/pilot/health":
                 if BackgroundModel is None:
@@ -370,9 +478,7 @@ class Handler(BaseHTTPRequestHandler):
                     pilot = _pilot()
                 except Exception as e:
                     return self._send_error(500, code="pilot_init_error", message=str(e))
-                snap = pilot.health()
-                snap["prefer_remote"] = bool(getattr(pilot, "cfg", None) and pilot.cfg.prefer_remote)  # type: ignore
-                return self._send_json(200, snap)
+                return self._send_json(200, pilot.health())
 
             # Unknown route
             return self._send_error(404, code="not_found", message="unknown GET path")
@@ -401,7 +507,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(404, code="not_found", message="unknown POST path")
 
         except ValueError as e:
-            # Typically JSON parse errors end up here from _read_json()
             return self._send_error(400, code="bad_json", message=str(e))
         except Exception as e:
             self.log_message("POST error: %s\n%s", repr(e), traceback.format_exc())
@@ -410,35 +515,28 @@ class Handler(BaseHTTPRequestHandler):
     # — Route handlers —
 
     def _handle_infer(self, data: dict):
-        # 1) Clean + validate request (now includes optional 'relax' block)
-        req = coerce_infer_request(data)          # tolerant shaping → InferRequest‑like obj
-        err = validate_infer_request(req)         # returns ErrorResponse or None
+        req = coerce_infer_request(data)
+        err = validate_infer_request(req)
         if err is not None:
             return self._send_json(400, err)
 
-        # 2) Ensure engine exists (and train lazily if needed in infer())
         eng = _engine()
 
-        # 3) Resolve tokens from (tokens | text) using our tiny tokenizer
         tok = SimpleTokenizer(vocab=eng.cfg.vocab)
         ids = resolve_tokens(req, tokenizer=tok, vocab=eng.cfg.vocab, seq_len=eng.cfg.seq_len)
 
-        # 4) Build tensor input (B=1) and run inference with chosen decoding strategy
         x = torch.tensor(ids, dtype=torch.long)
 
-        # Strategy/top‑k/p + optional relax normalized centrally
         decode_args = normalized_decode_args(req)
 
         out = eng.infer(
             x=x,
-            **decode_args,  # {'strategy','temperature','top_k','top_p','relax'}
+            **decode_args,
         )
 
-        # 5) Pack response (also provide detokenized text for convenience)
         base = pack_infer_response(out["tokens"], out["ledger"], tokenizer=tok)
         payload = asdict(base)
 
-        # If the model produced relaxation outputs, surface them.
         try:
             if "folds" in out:
                 t = out["folds"].detach().cpu()
@@ -451,7 +549,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json(200, payload)
 
     def _handle_steer(self, data: dict):
-        # 1) Coerce into dataclass with minimal fields (prompt/modality)
         try:
             req = SteerRequest(**data)
         except TypeError:
@@ -460,10 +557,8 @@ class Handler(BaseHTTPRequestHandler):
         if not req.prompt:
             return self._send_error(400, code="bad_request", message="missing 'prompt'")
 
-        # 2) Ensure engine/model exist; Engine.steer will lazy‑train if needed
         eng = _engine()
 
-        # 3) Return adapter output; also expose the mapped control (β,γ,⛔)
         try:
             from .experience.steering import SteeringController
             from .experience.adapters.base import AdapterRegistry as _AReg
@@ -487,7 +582,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json(200, resp)
 
     def _handle_train(self, data: dict):
-        # Small, synchronous training endpoint (useful for demos/tests).
         try:
             req = TrainRequest(**data)
         except TypeError:
@@ -504,35 +598,24 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json(200, TrainResponse(trained=True, steps=req.steps))
 
     def _handle_pilot_generate(self, data: dict):
-        # Optional BackgroundModel front; stays no‑op if module missing.
         if BackgroundModel is None:
             return self._send_error(501, code="pilot_unavailable",
                                     message="BackgroundModel not available (module import failed)")
 
-        # Accept one of:
-        #   1) {"messages":[{"role":"user","content":"..."} , ...]}
-        #   2) {"system":"...", "user":"..."}
-        #   3) {"prompt":"..."}     → becomes [{"role":"user","content":"..."}]
         msgs = data.get("messages")
         if msgs is None:
             sys_txt = data.get("system")
             user_txt = data.get("user")
-            prompt = data.get("prompt")
-            if prompt and isinstance(prompt, str):
-                msgs = [{"role": "user", "content": prompt}]
-            else:
-                if not (isinstance(sys_txt, str) or isinstance(user_txt, str)):
-                    return self._send_error(400, code="bad_request",
-                                            message="provide 'messages':[...], or 'system'/'user', or 'prompt'")
-                if as_messages is None:
-                    return self._send_error(500, code="pilot_init_error",
-                                            message="message helper not available")
-                msgs = as_messages(system=sys_txt or None, user=user_txt or None)
-
+            if not (isinstance(sys_txt, str) or isinstance(user_txt, str)):
+                return self._send_error(400, code="bad_request",
+                                        message="provide 'messages':[...], or 'system'/'user' strings")
+            if as_messages is None:
+                return self._send_error(500, code="pilot_init_error",
+                                        message="message helper not available")
+            msgs = as_messages(system=sys_txt or None, user=user_txt or None)
         if not isinstance(msgs, list):
             return self._send_error(400, code="bad_request", message="'messages' must be a list")
 
-        # Optional decode knobs
         temp = data.get("temperature")
         top_p = data.get("top_p")
         top_k = data.get("top_k")
@@ -556,7 +639,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send_error(502, code="pilot_error", message=str(e))
 
-        # Build a plain JSON view (no dataclass required)
         payload = {
             "text": out.text,
             "backend": out.backend,
@@ -575,18 +657,11 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     p = argparse.ArgumentParser(description="ElementFold HTTP server")
     p.add_argument("--host", type=str, default="127.0.0.1", help="bind address (default: 127.0.0.1)")
-    p.add_argument("--port", type=int, default: 8080, help="TCP port (default: 8080)")
-    p.add_argument("--no-brain-bootstrap", action="store_true",
-                   help="skip interactive brain bootstrap (use env only)")
+    p.add_argument("--port", type=int, default=8080, help="TCP port (default: 8080)")
     args = p.parse_args()
 
-    # Prompt only if TTY; otherwise skip quietly (you can set env before launching service)
-    if not args.no_brain_bootstrap:
-        try:
-            bootstrap_brain_env(interactive=sys.stdin.isatty())
-        except Exception:
-            # never block server start because of bootstrap
-            pass
+    # Prompt only if TTY; otherwise skip quietly (you can set env before launching)
+    bootstrap_brain_env(interactive=sys.stdin.isatty())
 
     srv = _HTTPServer((args.host, args.port), Handler)  # ThreadingHTTPServer when available
     print(f"⟲ ElementFold server ⟲  http://{args.host}:{args.port}   (Ctrl+C to stop)")
