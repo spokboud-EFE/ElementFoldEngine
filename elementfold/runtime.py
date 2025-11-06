@@ -20,7 +20,7 @@ from typing import Optional, Dict, Any
 import torch
 
 from .train import train_loop              # default training loop
-from .infer import infer_loop              # greedy/sampling decode
+from .infer import infer_loop              # greedy/sampling decode (+ optional relaxation clock)
 from .config import Config                 # typed configuration
 from .utils.logging import banner          # pretty δ⋆/β/γ banner
 
@@ -45,6 +45,11 @@ class Engine:
         self.cfg: Config = cfg or Config()
         self.model: Optional[torch.nn.Module] = None
         self._pending_state: Optional[Dict[str, Any]] = None  # weights to be loaded lazily
+
+        # Optional project‑wide default for the relaxation clock:
+        # If Config ever grows a .relax field, we’ll honor it; otherwise None (off).
+        self._relax_default: Optional[Dict[str, Any]] = getattr(self.cfg, "relax", None)
+
         # Be quiet by default; CLI (Studio) prints its own banner.
         if verbose:
             print(banner(self.cfg.delta, 1.0, 0.5))
@@ -77,6 +82,8 @@ class Engine:
         cfg = Config(**payload.get("cfg", {}))
         eng = cls(cfg)
         eng._pending_state = payload.get("state", None)      # model comes alive on first use
+        # If a future checkpoint includes cfg.relax, keep honoring it transparently.
+        eng._relax_default = getattr(eng.cfg, "relax", None)
         return eng
 
     # ──────────────────────────────────────────────────────────────────────
@@ -101,6 +108,7 @@ class Engine:
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        relax: Optional[Dict[str, Any]] = None,   # ⟲ NEW: optional diffusion‑decay / relaxation clock
     ) -> Dict[str, Any]:
         """
         Run an inference pass. If no model is present, materialize it (from a pending
@@ -111,9 +119,12 @@ class Engine:
                is generated for quick sampling demos.
             strategy: 'greedy' or 'sample'.
             temperature, top_k, top_p: sampling knobs when strategy='sample'.
+            relax: optional dict of relaxation‑clock knobs passed to infer_loop
+                   (see elementfold/infer.py header for fields). If None, we use
+                   Engine’s default (cfg.relax) when present; otherwise disabled.
 
         Returns:
-            A dict produced by infer_loop (e.g., {'tokens': Tensor, ...}).
+            A dict produced by infer_loop (e.g., {'tokens': Tensor, 'ledger': Tensor, ...}).
         """
         self._ensure_model()
 
@@ -122,6 +133,9 @@ class Engine:
             device = self.device
             x = torch.randint(0, self.cfg.vocab, (1, self.cfg.seq_len), device=device)
 
+        # Decide which relax knobs to pass down (explicit > default > off).
+        relax_kwargs = relax if (relax is not None) else self._relax_default
+
         return infer_loop(
             self.model,
             x,
@@ -129,6 +143,7 @@ class Engine:
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            relax=relax_kwargs,   # ← pass through; None keeps behavior identical to before
         )
 
     def steer(self, prompt: Optional[str] = None, modality: str = "language") -> Any:
