@@ -21,9 +21,12 @@
 #     and what it *predicts*. Plain words: tell Studio what needs to arrive.
 #   • with_spec(spec) decorator — attach a spec to a factory (no extra imports).
 #   • AdapterRegistry.spec(name) → AdapterSpec | None
-#   • AdapterRegistry.instantiate(name) → runner, with spec attached to runner
+#   • AdapterRegistry.instantiate(name) → runner, with spec/meta attached
 #   • AdapterRegistry.validate(name, feed) → readiness report for real data
 #   • AdapterRegistry.simulate(name, **kw) → optional simulate() if provided
+#   • AdapterMeta — human‑readable bits (kind/what/why/actions/params)
+#   • with_meta(meta) decorator — attach AdapterMeta (optional but nice)
+#   • AdapterRegistry.meta(name) → AdapterMeta | None
 #
 # Design notes:
 #   • Names are normalized to lowercase (ASCII) for stable CLI UX.
@@ -121,10 +124,36 @@ class AdapterSpec:
         return "\n".join(parts)
 
 
-# Small decorator to pin a spec on a factory (no extra machinery needed).
+# Human‑readable info that isn’t strictly a tensor contract (optional).
+@dataclass(frozen=True)
+class AdapterMeta:
+    """
+    Narrative metadata for Studio’s tables and help panels.
+
+    Plain words:
+      • kind: short category (“language”, “audio”, “multimodal”, …).
+      • what: one‑line “what this adapter is”.
+      • why:  one‑line “why you’d use it here”.
+      • actions: verbs the adapter understands (“hold”, “tick”, “status”, …).
+      • params: small public knobs users may pass in prompts (if any).
+    """
+    kind: str = "generic"
+    what: str = ""
+    why: str = ""
+    actions: Tuple[str, ...] = ()
+    params: Dict[str, str] = field(default_factory=dict)
+
+
+# Small decorators to pin a spec/meta on a factory (no extra machinery needed).
 def with_spec(spec: AdapterSpec) -> Callable[[Callable[[], Callable]], Callable[[], Callable]]:
     def _decor(factory: Callable[[], Callable]) -> Callable[[], Callable]:
         setattr(factory, "__adapter_spec__", spec)
+        return factory
+    return _decor
+
+def with_meta(meta: AdapterMeta) -> Callable[[Callable[[], Callable]], Callable[[], Callable]]:
+    def _decor(factory: Callable[[], Callable]) -> Callable[[], Callable]:
+        setattr(factory, "__adapter_meta__", meta)
         return factory
     return _decor
 
@@ -143,6 +172,7 @@ class ReadyReport:
 
 
 def _dtype_name(dt: Any) -> str:
+    """Return a stable string name for a dtype (torch or string)."""
     try:
         if torch is not None and isinstance(dt, torch.dtype):  # type: ignore[attr-defined]
             return str(dt).replace("torch.", "")
@@ -153,7 +183,7 @@ def _dtype_name(dt: Any) -> str:
 
 
 def _device_type(dev: Any) -> str:
-    # Accept torch.device, strings, or objects with '.type'
+    """Return 'cpu', 'cuda', or the given device string if neither."""
     if hasattr(dev, "type"):
         return str(getattr(dev, "type"))
     if isinstance(dev, str):
@@ -396,28 +426,37 @@ class AdapterRegistry:
         return _decorator
 
     # ────────────────────────────────────────────────────────────────────────
-    # Optional: specs, readiness, simulate, instantiate
+    # Optional: specs, metadata, readiness, simulate, instantiate
     # ────────────────────────────────────────────────────────────────────────
 
     @classmethod
     def spec(cls, name: str) -> Optional[AdapterSpec]:
-        """
-        Retrieve AdapterSpec attached to the factory (if any).
-        """
+        """Retrieve AdapterSpec attached to the factory (if any)."""
         factory = cls.get(name)
         return getattr(factory, "__adapter_spec__", None)
 
     @classmethod
+    def meta(cls, name: str) -> Optional[AdapterMeta]:
+        """Retrieve AdapterMeta attached to the factory (if any)."""
+        factory = cls.get(name)
+        return getattr(factory, "__adapter_meta__", None)
+
+    @classmethod
     def instantiate(cls, name: str) -> Callable:
         """
-        Materialize a runner from the factory and attach the spec (if any)
+        Materialize a runner from the factory and attach the spec/meta (if any)
         to the returned runner object/function for convenient introspection.
         """
         factory = cls.get(name)
         runner = factory()
         spec = getattr(factory, "__adapter_spec__", None)
+        meta = getattr(factory, "__adapter_meta__", None)
         try:
             setattr(runner, "__adapter_spec__", spec)
+        except Exception:
+            pass
+        try:
+            setattr(runner, "__adapter_meta__", meta)
         except Exception:
             pass
         return runner
@@ -451,7 +490,6 @@ class AdapterRegistry:
             return sim2(**kwargs)
 
         raise NotImplementedError(f"adapter:{_norm(name)} has no simulate()")
-    
 
     # ────────────────────────────────────────────────────────────────────────
     # Testing / maintenance helpers (no external callers in core flow)

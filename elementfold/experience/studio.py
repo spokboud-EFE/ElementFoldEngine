@@ -9,6 +9,7 @@
 #   • adjust decoding (/greedy, /sample t=... k=... p=...),
 #   • toggle fallback generation for multimodal/audio (/simulate, /strict),
 #   • enable/tune the relaxation clock (/relax ...),
+#   • inspect parameters (/params),
 #   • run a quick /infer,
 #   • save/load checkpoints,
 #   • inspect current settings via /status.
@@ -27,7 +28,9 @@ import json
 import time
 import threading
 import itertools
-from typing import Tuple, Any, Dict, Optional
+import pkgutil
+import importlib
+from typing import Tuple, Any, Dict, Optional, List
 
 import torch
 from ..utils.bootstrap import bootstrap_brain_env
@@ -54,7 +57,6 @@ except Exception:
 
 from .steering import SteeringController
 from .adapters.base import AdapterRegistry
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Lightweight color + spinner (no external deps)
@@ -103,7 +105,6 @@ class _Spinner:
         self._stop.set()
         time.sleep(0.02)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Relaxation clock (diffusion–decay) defaults + helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -128,8 +129,7 @@ def _relax_clean_set(cfg: dict, updates: dict) -> dict:
             if kn in ("eta", "rho", "lambda", "d", "phi_inf", "eta_path_weight", "dt"):
                 fv = float(v)
                 if kn in ("eta", "lambda", "d"): fv = max(0.0, fv)
-                if kn == "rho": fv = min(max(fv, 0.0), 1.0)
-                if kn == "eta_path_weight": fv = min(max(fv, 0.0), 1.0)
+                if kn in ("rho", "eta_path_weight"): fv = min(max(fv, 0.0), 1.0)
                 if kn == "dt": fv = max(1e-8, fv)
                 kmap = {"d": "D"}.get(kn, kn)
                 out[kmap] = fv
@@ -144,50 +144,79 @@ def _relax_kv_line(cfg: dict) -> str:
             f"λ={cfg['lambda']:.3f}, D={cfg['D']:.3f}, Φ∞={cfg['phi_inf']:.2f}, "
             f"steps={int(cfg['steps'])}, dt={cfg['dt']:.2f}")
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Autoload adapters so the registry is never empty
+# Adapter autoload (dynamic discovery across experience/adapters/*.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _autoload_adapters() -> None:
+def _autoload_adapters(verbose: bool = False) -> List[str]:
     """
-    Import adapter modules for their registration side‑effects.
-    Keeps Studio UX stable across fresh installs.
+    Dynamically import all adapter modules in experience/adapters/.
+    This ensures every adapter registers itself in AdapterRegistry.
+    Returns the list of modules successfully imported.
     """
+    imported: List[str] = []
     try:
-        from .adapters import language   # noqa: F401
-    except Exception:
-        pass
-    try:
-        from .adapters import audio      # noqa: F401
-    except Exception:
-        pass
-    try:
-        from .adapters import multimodal # noqa: F401
-    except Exception:
-        pass
-    try:
-        from .adapters import resonator  # optional; registers "resonator"
-    except Exception:
-        pass
+        from . import adapters as adapters_pkg
+    except Exception as e:
+        warn(f"failed to import adapters package: {e}")
+        return imported
 
+    for finder, name, ispkg in pkgutil.iter_modules(adapters_pkg.__path__):
+        if name.startswith("_") or name in {"base", "__init__", "loaders"}:
+            continue
+        fq = f"{adapters_pkg.__name__}.{name}"
+        try:
+            importlib.import_module(fq)
+            imported.append(name)
+        except Exception as e:
+            warn(f"adapter import failed: {name}: {e}")
+    if verbose:
+        if imported:
+            info("adapters discovered: " + ", ".join(imported))
+        else:
+            warn("no adapters discovered")
+    return imported
+
+def _adapter_specs() -> List[Dict[str, Any]]:
+    """Build a presentable spec list from the registry + adapter factories."""
+    specs: List[Dict[str, Any]] = []
+    for nm in AdapterRegistry.names():
+        try:
+            fac = AdapterRegistry.get(nm)
+        except KeyError:
+            continue
+        kind = getattr(fac, "KIND", None) or getattr(fac, "kind", None) or "—"
+        desc = (getattr(fac, "DESCRIPTION", None) or getattr(fac, "description", None) or
+                (fac.__doc__ or "").strip() or "No description.")
+        if isinstance(desc, str):
+            # take first sentence-ish
+            desc = desc.replace("\n", " ")
+            dot = desc.find(".")
+            if 20 <= dot <= 140:
+                desc = desc[:dot+1]
+            desc = desc[:160]
+        specs.append({"name": nm, "kind": str(kind), "what": str(desc)})
+    # stable sort by name
+    specs.sort(key=lambda d: d["name"])
+    return specs
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Help / parsing helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _help_text() -> str:
-    names = ", ".join(AdapterRegistry.names()) or "∅"
+def _help_text(avail_names: str) -> str:
     return f"""\
 Commands:
-/mod <name>|list                 select an adapter (available: {names})
-/adapters [reload]               list (or reload) registered adapters
+/mod <name>|list                 select an adapter (available: {avail_names})
+/adapters [list|reload|json|select <name|#>]
+                                 show or pick adapters (number quick‑pick supported)
 /greedy                          set strategy=greedy
 /sample t=<T> k=<K> p=<P>        set strategy=sample and knobs (T∈[0,∞), K≥0, P∈(0,1))
 /simulate on|off                 allow synthetic fallbacks for multimodal/audio
-/strict on|off                   when on (default), *wait* for real data tensors/paths
+/strict on|off                   when on (default), wait for real data tensors/paths
 /relax [show|on|off|reset|set k=v ...]
                                  relaxation clock (diffusion–decay) controls
+/params                          list key parameters with human explanations
 /infer                           run quick inference (random seed tokens)
 /status                          show current settings
 /save <path>                     save checkpoint (weights+cfg)
@@ -196,8 +225,8 @@ Commands:
 /quit | /exit                    leave the studio
 
 Usage:
-  1) Choose an adapter:   /mod resonator
-  2) Type adapter text:   help   |   init δ=0.5   |   hold   |   step up 2   |   tick 5
+  1) Choose an adapter:   /adapters   then type a number, or  /mod resonator
+  2) Adapter text:        help   |   init δ=0.5   |   hold   |   step up 2   |   tick 5
   3) Watch gauges:        β (exposure), γ (damping), ⛔ (safety clamp)
 """
 
@@ -219,7 +248,6 @@ def _parse_on_off(s: str, default: bool) -> bool:
     if s in {"on", "true", "1", "yes"}:  return True
     if s in {"off", "false", "0", "no"}: return False
     return default
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Friendly rendering + small “counsellor” for non‑experts
@@ -300,14 +328,46 @@ def _print_adapter_output(out: Any) -> None:
 
     print("→", str(out)[:2000])
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Human‑readable /params presenter
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PARAM_WHAT = {
+    "β": ("exposure", "how boldly structure emerges", "raise to surface new patterns"),
+    "γ": ("damping", "how much motion is calmed", "raise to steady; lower to respond faster"),
+    "⛔": ("safety clamp", "caps negative gate depth", "raise if clipping; lower to be conservative"),
+}
+_RELAX_WHAT = {
+    "eta": ("share rate", "folds per step added along a path", "raises redshift per unit distance"),
+    "eta_path_weight": ("path weight", "mix with |ΔX| for adaptive sharing", "more weight → more path‑aware smoothing"),
+    "rho": ("temp lift", "adds heat with distance", "avoids collapse in long paths"),
+    "lambda": ("let‑go", "local exponential decay toward Φ∞", "higher → faster local calming"),
+    "D": ("diffusion", "spreads tension along sequence", "smooths bumps within outputs"),
+    "phi_inf": ("calm baseline", "target potential value", "far future background level"),
+    "steps": ("ticks", "explicit smoothing ticks per decode", "more steps → smoother, slower"),
+    "dt": ("tick size", "size of each step", "smaller is safer"),
+}
+
+def _print_params(beta: float, gamma: float, clamp: float, relax_cfg: dict) -> None:
+    for name, (tag, does, why) in _PARAM_WHAT.items():
+        if name == "β":
+            val = beta
+        elif name == "γ":
+            val = gamma
+        else:
+            val = clamp
+        print(f"{name:>2}  — {tag:14} | now {val:6.3f} | {does} | why: {why}")
+    for k, (tag, does, why) in _RELAX_WHAT.items():
+        v = relax_cfg[k]
+        print(f"{k:>12} — {tag:14} | now {v:8.3f} | {does} | why: {why}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main REPL (with prompt and soft exit)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def studio_main() -> None:
-    # Load adapters up‑front so the registry is populated.
-    _autoload_adapters()
+    # Load adapters up‑front so the registry is populated (dynamic discovery).
+    _autoload_adapters(verbose=False)
 
     # Ask for remote brain if not set (RAM-only)
     bootstrap_brain_env(interactive=True)
@@ -317,17 +377,21 @@ def studio_main() -> None:
     ctrl = SteeringController.load_default(cfg.delta)
 
     # Defaults
-    adapter_name = "language"          # may be overridden via /mod <name>
+    adapter_name = "language"          # may be overridden via /mod or /adapters
     strategy = "greedy"
     temperature, top_k, top_p = 1.0, 0, 0.0
     simulate, strict = False, True
 
-    # Diffusion–decay is mandatory by default (can be toggled off).
+    # Diffusion–decay is on by default (can be toggled off).
     relax_enabled = True
     relax_cfg: Dict[str, float | int] = dict(RELAX_DEFAULT)
 
     # Keep a *stateful* runner for the selected adapter (resonator benefits).
     runner = None
+
+    # Simple “menu context” so numbers can pick items right after /adapters.
+    menu_ctx: Optional[Dict[str, Any]] = None
+
     def _ensure_runner() -> None:
         nonlocal runner
         if runner is None:
@@ -335,8 +399,8 @@ def studio_main() -> None:
             runner = factory()  # stateful callable: runner(model, prompt, style)
 
     # Opening banner and hints
-    print(banner(cfg.delta, 1.0, 0.5))
     avail = ", ".join(AdapterRegistry.names()) or "∅"
+    print(banner(cfg.delta, 1.0, 0.5))
     print(f"↳ adapters: {avail}")
     print("↳ type text (adapter run), or commands like '/mod resonator', '/sample t=0.8 k=40 p=0.95', '/infer'.  Ctrl+C to exit.\n")
     info(f"relax: {'on' if relax_enabled else 'off'}  •  {_relax_kv_line(relax_cfg)}")
@@ -352,14 +416,33 @@ def studio_main() -> None:
             if not s:
                 continue
 
+            # If user just listed adapters and now types a number, quick‑select.
+            if menu_ctx and s.isdigit() and menu_ctx.get("type") == "adapters":
+                idx = int(s) - 1
+                choices = menu_ctx.get("choices", [])
+                if 0 <= idx < len(choices):
+                    adapter_name = choices[idx]["name"]
+                    runner = None
+                    success(f"adapter = {adapter_name}")
+                    # Re-show list to confirm selection
+                    _show_adapters_list(adapter_name)
+                    menu_ctx = None
+                    continue
+                else:
+                    warn("no such adapter number")
+                    continue
+
             # Commands
             if s.startswith("/"):
+                avail_names = ", ".join(AdapterRegistry.names()) or "∅"
+
                 if s.startswith("/help"):
-                    print(_help_text());  continue
+                    print(_help_text(avail_names));  continue
 
                 if s.startswith("/quit") or s.startswith("/exit"):
                     print("bye.");  break
 
+                # /mod: legacy quick switch
                 if s.startswith("/mod"):
                     parts = s.split(None, 1)
                     if len(parts) == 1:
@@ -367,24 +450,57 @@ def studio_main() -> None:
                         continue
                     arg = parts[1].strip().lower()
                     if arg == "list":
-                        print("↳ adapters:", ", ".join(AdapterRegistry.names()) or "∅")
+                        _show_adapters_list(adapter_name)
+                        menu_ctx = {"type": "adapters", "choices": _adapter_specs()}
                         continue
-                    # verify adapter exists
                     try:
                         AdapterRegistry.get(arg)
                     except KeyError:
-                        error(f"unknown adapter: {arg!r}  (available: {', '.join(AdapterRegistry.names()) or '∅'})")
+                        error(f"unknown adapter: {arg!r}  (available: {avail_names})")
                         continue
                     adapter_name = arg
-                    runner = None  # switch ⇒ rebuild runner to reset state for the new adapter
+                    runner = None
                     success(f"adapter = {adapter_name}")
                     continue
 
+                # /adapters command family
                 if s.startswith("/adapters"):
-                    if "reload" in s:
-                        _autoload_adapters()
+                    toks = s.split()
+                    mode = toks[1] if len(toks) > 1 else "list"
+                    if mode == "reload":
+                        _autoload_adapters(verbose=True)
                         success("adapters reloaded")
-                    print("↳ adapters:", ", ".join(AdapterRegistry.names()) or "∅")
+                        _show_adapters_list(adapter_name)
+                        menu_ctx = {"type": "adapters", "choices": _adapter_specs()}
+                        continue
+                    if mode == "json":
+                        print(json.dumps(_adapter_specs(), indent=2, ensure_ascii=False))
+                        continue
+                    if mode == "select":
+                        if len(toks) < 3:
+                            print("usage: /adapters select <name|#>")
+                            continue
+                        pick = toks[2].strip().lower()
+                        if pick.isdigit():
+                            idx = int(pick) - 1
+                            choices = _adapter_specs()
+                            if 0 <= idx < len(choices):
+                                pick = choices[idx]["name"]
+                            else:
+                                error("no such adapter number")
+                                continue
+                        try:
+                            AdapterRegistry.get(pick)
+                        except KeyError:
+                            error(f"unknown adapter: {pick!r}  (available: {avail_names})")
+                            continue
+                        adapter_name = pick
+                        runner = None
+                        success(f"adapter = {adapter_name}")
+                        continue
+                    # default: list
+                    _show_adapters_list(adapter_name)
+                    menu_ctx = {"type": "adapters", "choices": _adapter_specs()}
                     continue
 
                 if s.startswith("/greedy"):
@@ -426,7 +542,6 @@ def studio_main() -> None:
                         success("relax knobs reset to defaults")
                         info(_relax_kv_line(relax_cfg));  continue
                     if arg.startswith("set"):
-                        # parse k=v pairs
                         updates = {}
                         for tok in re.findall(r"([A-Za-z_]+)\s*=\s*([-+eE0-9.]+)", arg):
                             updates[tok[0]] = tok[1]
@@ -434,6 +549,14 @@ def studio_main() -> None:
                         success("relax knobs updated")
                         info(_relax_kv_line(relax_cfg));  continue
                     warn("usage: /relax [show|on|off|reset|set eta=... rho=... D=... lambda=... steps=... dt=...]")
+                    continue
+
+                if s.startswith("/params"):
+                    # Show human rows for β, γ, ⛔ and relax knobs
+                    # We don't know the current β/γ/⛔ until a line is steered; show neutral placeholders.
+                    v0 = ctrl("")                       # cold map, still deterministic
+                    p0 = SteeringController.to_params(v0)
+                    _print_params(p0["beta"], p0["gamma"], p0["clamp"], relax_cfg)
                     continue
 
                 if s.startswith("/infer"):
@@ -495,6 +618,7 @@ def studio_main() -> None:
                         error(f"not found: {path}")
                         continue
                     eng = Engine.from_checkpoint(path)
+                    runner = None  # invalidate old runner; model context changed
                     success(f"loaded checkpoint (lazy) ← {path}")
                     continue
 
@@ -502,7 +626,6 @@ def studio_main() -> None:
                 continue
 
             # Normal line: send to the selected adapter
-            # Map steering vector → control parameters (β, γ, ⛔) and a 'style' embedding
             v = ctrl(s)                                   # raw ℝ⁸
             params = SteeringController.to_params(v)      # {'beta','gamma','clamp','style'}
             beta, gamma, clamp = params["beta"], params["gamma"], params["clamp"]
@@ -551,7 +674,7 @@ def studio_main() -> None:
                     _ = eng.infer(x=None, relax=(relax_cfg if relax_enabled else None))  # triggers lazy fit/materialize
                 success("model ready")
 
-            # Prepare prompt for adapters that accept dicts so decode knobs (and relax) flow through
+            # Prepare prompt so decode knobs (and relax) flow through where supported
             def _wrap_for_adapter(adapter_name: str, line: str) -> Any:
                 if adapter_name in {"multimodal", "audio"}:
                     return {
@@ -578,11 +701,23 @@ def studio_main() -> None:
             except KeyError:
                 error(f"unknown adapter: {adapter_name!r}  (available: {', '.join(AdapterRegistry.names()) or '∅'})")
             except Exception as e:
-                # Keep REPL alive; surface the error briefly
                 error(f"adapter error: {type(e).__name__}: {e}")
 
     except KeyboardInterrupt:
         print("\n" + dim_txt("⟲ exit requested — goodbye."))
+
+# Helper to present adapters in a readable "one per row" list
+def _show_adapters_list(current: str) -> None:
+    specs = _adapter_specs()
+    if not specs:
+        print("↳ adapters: ∅")
+        return
+    print("↳ adapters (pick with '/adapters select <name|#>' or type a number next):")
+    for i, sp in enumerate(specs, 1):
+        mark = green_txt("●") if sp["name"] == current else "○"
+        kind = f"[{sp['kind']}]" if sp["kind"] and sp["kind"] != "—" else ""
+        desc = sp["what"]
+        print(f"  {i:>2}. {mark} {sp['name']} {kind} — {desc}")
 
 if __name__ == "__main__":
     studio_main()
