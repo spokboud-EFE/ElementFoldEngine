@@ -22,7 +22,7 @@ import torch
 from .train import train_loop              # default training loop
 from .infer import infer_loop              # greedy/sampling decode (+ optional relax)
 from .config import Config                 # typed configuration
-from .utils.logging import banner          # pretty δ⋆/β/γ banner
+from .utils.display import banner          # pretty δ⋆/β/γ banner
 
 
 class Engine:
