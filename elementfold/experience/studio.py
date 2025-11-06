@@ -30,7 +30,7 @@ import itertools
 from typing import Tuple, Any, Dict, Optional
 
 import torch
-
+from ..utils.bootstrap import bootstrap_brain_env
 from ..config import Config
 from ..runtime import Engine
 
@@ -309,6 +309,8 @@ def studio_main() -> None:
     # Load adapters up‑front so the registry is populated.
     _autoload_adapters()
 
+    # Ask for remote brain if not set (RAM-only)
+    bootstrap_brain_env(interactive=True)
     # Config + Engine (lazy model)
     cfg = Config()
     eng = Engine(cfg)                  # lazy; will train or materialize on demand
