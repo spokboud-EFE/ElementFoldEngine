@@ -1,4 +1,5 @@
-# ElementFoldEngine -- EFE
+# ElementFoldEngine -- EFE -- [![DOI](https://zenodo.org/badge/1086358952.svg)](https://doi.org/10.5281/zenodo.17518213)
+
 ##### Author: Sam Blouin
 
 Proving that coherence itself can be engineered as the new foundation of intelligence and design.
@@ -46,7 +47,6 @@ Theory ---> [EFE Theory](https://doi.org/10.5281/zenodo.17481738)
 
 
 
-[![DOI](https://zenodo.org/badge/1086358952.svg)](https://doi.org/10.5281/zenodo.17518213)
 
 
 
