@@ -2,7 +2,7 @@
 
 ##### Author: Sam Blouin
 
-Proving that coherence itself can be engineered as the new foundation of intelligence and design.
+**Proving that coherence itself can be engineered as the new foundation of intelligence and design.**
 
 This work is publicly available exclusively for non-profit organizations. Reproductions for profit arent allowed without a custom commercial license.
 
