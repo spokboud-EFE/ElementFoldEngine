@@ -6,17 +6,17 @@
 #   • Offer tiny utilities to resolve text→tokens (without importing the model),
 #     and to clamp/clean decode knobs (temperature/top‑k/top‑p).
 #
-# Extras (quality-of-life):
+# Extras (quality‑of‑life):
 #   • JSON is sanitized so NaN/±Inf never leak to clients (RFC‑clean).
 #   • Strategy synonyms accepted ('argmax'→'greedy', 'sampling'→'sample').
 #   • Token lists accept tuples/iterables in addition to lists.
+#   • Top‑level JSON must be an *object* (dict); arrays/scalars are rejected with a 400.
 
 from __future__ import annotations                # ✴ forward type hints
 from dataclasses import dataclass, asdict         # ✴ tiny, typed records
 from typing import Optional, List, Dict, Any, Iterable
-import json                                      # ✴ JSON encode/decode
-import math                                      # ✴ finite checks
-
+import json                                       # ✴ JSON encode/decode
+import math                                       # ✴ finite checks
 
 # ———————————————————————————————————————————————————————————
 # Request / Response schemas (small, explicit dataclasses)
@@ -39,46 +39,51 @@ class InferResponse:                              # ✴ /infer output
     text: Optional[str] = None                    # optional detokenized text
 
 @dataclass
-class SteerRequest:                                # ✴ /steer input
-    prompt: str                                    # human intent
-    modality: str = "language"                     # adapter key (e.g., 'language', 'vision')
+class SteerRequest:                               # ✴ /steer input
+    prompt: str                                   # human intent
+    modality: str = "language"                    # adapter key (e.g., 'language', 'vision')
 
 @dataclass
-class SteerResponse:                                # ✴ /steer output
-    output: Any                                     # adapter‑specific (often a string)
-    params: Optional[Dict[str, Any]] = None         # optional applied {beta,gamma,clamp,...}
+class SteerResponse:                              # ✴ /steer output
+    output: Any                                   # adapter‑specific (often a string)
+    params: Optional[Dict[str, Any]] = None       # optional applied {beta,gamma,clamp,...}
 
 @dataclass
-class HealthResponse:                               # ✴ /health
-    status: str = "ok"                              # 'ok'|'degraded'...
-    version: str = "unknown"                        # project version string (server fills this)
-    device: str = "cpu"                             # 'cpu'|'cuda'
-    model_ready: bool = False                       # whether weights are live
+class HealthResponse:                             # ✴ /health
+    status: str = "ok"                            # 'ok'|'degraded'...
+    version: str = "unknown"                      # project version string (server fills this)
+    device: str = "cpu"                           # 'cpu'|'cuda'
+    model_ready: bool = False                     # whether weights are live
 
 @dataclass
-class TrainRequest:                                  # ✴ /train input (optional API)
-    steps: int = 200                                 # number of optimization steps
+class TrainRequest:                               # ✴ /train input (optional API)
+    steps: int = 200                              # number of optimization steps
 
 @dataclass
-class TrainResponse:                                 # ✴ /train output
-    trained: bool = True                             # whether training ran
-    steps: int = 0                                   # steps actually performed
+class TrainResponse:                              # ✴ /train output
+    trained: bool = True                          # whether training ran
+    steps: int = 0                                # steps actually performed
 
 @dataclass
-class ErrorResponse:                                  # ✴ unified errors
-    code: str                                        # short code (e.g., 'bad_request')
-    message: str                                     # human‑readable description
-    details: Optional[Dict[str, Any]] = None         # optional payload for debugging
-
+class ErrorResponse:                              # ✴ unified errors
+    code: str                                     # short code (e.g., 'bad_request')
+    message: str                                  # human‑readable description
+    details: Optional[Dict[str, Any]] = None      # optional payload for debugging
 
 # ———————————————————————————————————————————————————————————
 # JSON helpers (bytes⇄dict) with dataclass support
 # ———————————————————————————————————————————————————————————
 
 def parse_json(body: bytes) -> Dict[str, Any]:
-    """Decode bytes→dict; empty body → {}. Invalid JSON raises ValueError (caught by server)."""
-    return json.loads(body.decode("utf-8")) if body else {}
-
+    """
+    Decode bytes→dict; empty body → {}.
+    Enforces an object (dict) at the top level; arrays/scalars are rejected
+    so route handlers never see a non‑mapping `payload`.
+    """
+    obj = json.loads(body.decode("utf-8")) if body else {}
+    if not isinstance(obj, dict):
+        raise ValueError("top‑level JSON must be an object (e.g., { ... })")
+    return obj
 
 def _json_sanitize(x: Any) -> Any:
     """
@@ -95,14 +100,12 @@ def _json_sanitize(x: Any) -> Any:
         return float(x)
     return x
 
-
 def to_json(obj: Any) -> bytes:
     """Encode Python objects → bytes. Dataclasses are converted via asdict()."""
     if hasattr(obj, "__dataclass_fields__"):
         obj = asdict(obj)                           # ✴ serialize @dataclass
     obj = _json_sanitize(obj)                       # ✴ ensure RFC‑clean numbers
     return json.dumps(obj, ensure_ascii=False, allow_nan=False).encode("utf-8")
-
 
 # ———————————————————————————————————————————————————————————
 # Light validation + coercion utilities for /infer
@@ -133,7 +136,6 @@ def _as_int_list(x: Any) -> Optional[List[int]]:
             return None
     return out
 
-
 def _clean_strategy(s: Any) -> str:
     """Normalize strategy value; fall back to 'greedy'. Accepts common aliases."""
     try:
@@ -143,7 +145,6 @@ def _clean_strategy(s: Any) -> str:
     s = _STRATEGY_ALIASES.get(s, s)
     return s if s in _ALLOWED_STRATEGIES else "greedy"
 
-
 def _clamp_temperature(t: Any) -> float:
     """Map to a safe positive temperature (≥1e‑8)."""
     try:
@@ -151,7 +152,6 @@ def _clamp_temperature(t: Any) -> float:
     except Exception:
         return 1.0
     return max(1e-8, t)
-
 
 def _clean_top_k(k: Any) -> Optional[int]:
     """Map to None or positive int."""
@@ -163,7 +163,6 @@ def _clean_top_k(k: Any) -> Optional[int]:
         return None
     return k if k > 0 else None
 
-
 def _clean_top_p(p: Any) -> Optional[float]:
     """Map to None or float in (0,1)."""
     if p is None:
@@ -174,7 +173,6 @@ def _clean_top_p(p: Any) -> Optional[float]:
         return None
     return p if 0.0 < p < 1.0 else None
 
-
 def _clean_max_len(m: Any) -> Optional[int]:
     """Map to None or positive int."""
     if m is None:
@@ -184,7 +182,6 @@ def _clean_max_len(m: Any) -> Optional[int]:
     except Exception:
         return None
     return m if m > 0 else None
-
 
 def coerce_infer_request(payload: Dict[str, Any]) -> InferRequest:
     """
@@ -199,7 +196,6 @@ def coerce_infer_request(payload: Dict[str, Any]) -> InferRequest:
     max_len = _clean_max_len(payload.get("max_len"))
     return InferRequest(tokens=tokens, text=text, strategy=strategy,
                         temperature=temperature, top_k=top_k, top_p=top_p, max_len=max_len)
-
 
 def validate_infer_request(req: InferRequest) -> Optional[ErrorResponse]:
     """
@@ -216,6 +212,19 @@ def validate_infer_request(req: InferRequest) -> Optional[ErrorResponse]:
                              message=f"unknown strategy: {req.strategy!r}")
     return None
 
+def normalized_decode_args(req: InferRequest) -> Dict[str, Any]:
+    """
+    Convenience: return a dict you can unpack into Engine.infer(...).
+    • For 'greedy', sampling knobs are nulled.
+    • For 'sample', ensure temperature>0; top_k/top_p are passed through as cleaned.
+    """
+    if req.strategy == "greedy":
+        return {"strategy": "greedy", "temperature": 1.0, "top_k": None, "top_p": None}
+    # sample
+    return {"strategy": "sample",
+            "temperature": max(1e-8, float(req.temperature)),
+            "top_k": req.top_k,
+            "top_p": req.top_p}
 
 # ———————————————————————————————————————————————————————————
 # Tokenization helpers (pure‑Python; server wires a tokenizer)
@@ -244,10 +253,35 @@ def resolve_tokens(req: InferRequest, tokenizer, vocab: int, seq_len: int) -> Li
     ids = [max(0, min(int(t), vocab - 1)) for t in (ids or [0])]
     return ids[:limit]
 
-
 # ———————————————————————————————————————————————————————————
 # Response packers
 # ———————————————————————————————————————————————————————————
+
+def _tolist_first_row(x) -> List:
+    """
+    Best‑effort convert (Tensor | array‑like | list) to a Python list.
+    If 2‑D, return the *first row*; if 1‑D, return as‑is.
+    """
+    # Torch tensor path (preferred)
+    try:
+        t = x.detach().cpu()
+        if t.dim() == 1:
+            return t.tolist()
+        return t[0].tolist()
+    except Exception:
+        pass
+    # Generic: something with .tolist()
+    try:
+        arr = x.tolist()
+        # If it's a nested list (2‑D), take first row
+        return arr[0] if (arr and isinstance(arr[0], (list, tuple))) else arr
+    except Exception:
+        pass
+    # Already a Python list/tuple?
+    if isinstance(x, (list, tuple)):
+        return list(x[0]) if (x and isinstance(x[0], (list, tuple))) else list(x)
+    # Scalar fallback
+    return [x]
 
 def pack_infer_response(tokens_tensor, ledger_tensor, tokenizer=None) -> InferResponse:
     """
@@ -256,17 +290,12 @@ def pack_infer_response(tokens_tensor, ledger_tensor, tokenizer=None) -> InferRe
       • ledger_tensor: (B,T) float (we flatten the first row),
       • tokenizer (optional): if provided, we detokenize to .text.
     """
-    # Defensive shape handling
-    tt = tokens_tensor.detach().cpu()
-    lt = ledger_tensor.detach().cpu()
-    if tt.dim() == 1:
-        tokens = tt.tolist()
-    else:
-        tokens = tt[0].tolist()
-    if lt.dim() == 1:
-        ledger = lt.tolist()
-    else:
-        ledger = lt[0].tolist()
+    tokens = _tolist_first_row(tokens_tensor)
+    ledger = _tolist_first_row(ledger_tensor)
+
+    # Type‑coerce defensively to plain ints/floats
+    tokens = [int(t) for t in tokens]
+    ledger = [float(v) for v in ledger]
 
     text = None
     if tokenizer is not None:
@@ -276,7 +305,6 @@ def pack_infer_response(tokens_tensor, ledger_tensor, tokenizer=None) -> InferRe
             text = None
 
     return InferResponse(tokens=tokens, ledger=ledger, text=text)
-
 
 def pack_error(code: str, message: str, details: Dict[str, Any] | None = None) -> ErrorResponse:
     """Small convenience to build ErrorResponse consistently."""
