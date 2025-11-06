@@ -16,12 +16,13 @@
 #
 # Contract with Studio:
 #   ctrl = SteeringController.load_default(cfg.delta)
-#   v    = ctrl("gentle, coherent")     # → ℝ⁸
-#   p    = SteeringController.to_params(v)  # → {'beta','gamma','clamp','style'}
+#   v    = ctrl("gentle, coherent")               # → ℝ⁸
+#   p    = SteeringController.to_params(v)        # → {'beta','gamma','clamp','style', 'style_norm'}
 #
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Tuple, Optional
+import math
 import torch
 import torch.nn as nn
 
@@ -39,6 +40,15 @@ def _sigmoid_range(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
     return torch.sigmoid(x) * (hi - lo) + lo
 
 
+def _tanh_range(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    """
+    Map ℝ → [lo, hi] with tanh; handy for style normalization into [-1,1] or a narrow band.
+    """
+    mid = 0.5 * (hi + lo)
+    half = 0.5 * (hi - lo)
+    return mid + half * torch.tanh(x)
+
+
 class SteeringController(nn.Module):  # 🎚 intent → (β, γ, ⛔, style₅)
     """
     A tiny intent→control head. Forward returns a raw ℝ⁸ vector; use .to_params()
@@ -47,18 +57,19 @@ class SteeringController(nn.Module):  # 🎚 intent → (β, γ, ⛔, style₅)
     Notes:
       • δ⋆ (delta) is cached for convenience—some adapters may want to read it.
       • Tokenizer is intentionally tiny (vocab≈256); mean‑pooling is robust for short prompts.
+      • Ranges can match Supervisor/RungController rails by passing `rails=...` to to_params().
     """
 
-    # For very long prompts, we can cap length to keep latency predictable.
+    # For very long prompts, we cap length to keep latency predictable.
     MAX_TOKENS: int = 512
 
-    def __init__(self, delta: float = 0.030908106561043047):
+    def __init__(self, delta: float = 0.030908106561043047, vocab: int = 256):
         super().__init__()
         self.delta = float(delta)               # δ⋆ cached (read‑only convenience)
 
         # — Embedding —
-        # Keep in sync with SimpleTokenizer (vocab size = 256). Each token → ℝ⁶⁴.
-        self.emb = nn.Embedding(256, 64)
+        # Keep in sync with SimpleTokenizer (vocab size ~ 256). Each token → ℝ⁶⁴.
+        self.emb = nn.Embedding(vocab, 64)
 
         # — Head (MLP) —
         # A tiny two‑layer perceptron: ℝ⁶⁴ → ℝ⁸ = [β̂, γ̂, ⛔̂, style₅].
@@ -67,6 +78,9 @@ class SteeringController(nn.Module):  # 🎚 intent → (β, γ, ⛔, style₅)
             nn.ReLU(),
             nn.Linear(64, 8),
         )
+
+        # Cache a tokenizer instance to avoid per‑call construction overhead.
+        self._tok = SimpleTokenizer(vocab=vocab) if hasattr(SimpleTokenizer, "__call__") else SimpleTokenizer()
 
     # ————————————————————————————————————————————————
     # Core forward (kept trainable for fine‑tuning)
@@ -85,69 +99,101 @@ class SteeringController(nn.Module):  # 🎚 intent → (β, γ, ⛔, style₅)
         Returns:
             torch.Tensor shape (8,), dtype float32 by default.
         """
-        tok = SimpleTokenizer()
-        ids = tok.encode(s)
-
-        # Guard: allow empty input, cap extremely long inputs to bound latency.
+        # Tokenize (allow empty input; cap length)
+        try:
+            ids = self._tok.encode(s or "")
+        except Exception:
+            ids = []
         if not ids:
             ids = [0]
         if len(ids) > self.MAX_TOKENS:
             ids = ids[: self.MAX_TOKENS]
 
         dev = self.emb.weight.device
-        x = torch.tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)  # (1, L)
-        e = self.emb(x).mean(dim=1)                                       # (1, 64)
-        v = self.fc(e).squeeze(0)                                         # (8,)
+        x = torch.as_tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)  # (1, L)
+        e = self.emb(x).mean(dim=1)                                          # (1, 64)
+        v = self.fc(e).squeeze(0)                                            # (8,)
         return v
 
     # ————————————————————————————————————————————————
     # Helpers: map raw vector → meaningful ranges
     # ————————————————————————————————————————————————
     @staticmethod
-    def to_params(v: torch.Tensor) -> Dict[str, object]:
+    def to_params(
+        v: torch.Tensor,
+        rails: Optional[Dict[str, Tuple[float, float]]] = None,
+        include_style_norm: bool = True,
+    ) -> Dict[str, object]:
         """
-        Convert a raw ℝ⁸ vector (as returned by forward) into interpretable parameters
-        with ranges aligned to the Supervisor’s defaults:
+        Convert a raw ℝ⁸ vector (as returned by forward) into interpretable parameters.
 
-            β    ∈ [0.5, 2.0]
-            γ    ∈ [0.0, 0.9]
-            ⛔   ∈ [1.0, 10.0]
-            style ∈ ℝ⁵  (left unconstrained; adapters can interpret freely)
+        Ranges:
+            By default (conservative):
+                β    ∈ [0.5, 2.0]
+                γ    ∈ [0.0, 0.9]
+                ⛔   ∈ [1.0, 10.0]
+            To fully match RungController rails (see RungTuning), pass:
+                rails={'beta':(0.5,3.0), 'gamma':(0.0,1.5), 'clamp':(1.0,12.0)}
 
         Returns:
-            {'beta': float, 'gamma': float, 'clamp': float, 'style': torch.Tensor(5,)}
+            {
+              'beta': float, 'gamma': float, 'clamp': float,
+              'style': List[float],                 # raw style (length 5)
+              'style_norm': List[float] (optional)  # tanh‑normalized to [-1,1] (length 5)
+            }
         """
-        # Ensure predictable dtype/device; drop grad to avoid leaking graphs into the UI.
+        # Rails (lo, hi) per control
+        r = rails or {"beta": (0.5, 2.0), "gamma": (0.0, 0.9), "clamp": (1.0, 10.0)}
+
         with torch.no_grad():
             v = v.to(dtype=torch.float32)
 
             # Map first three controls into safe physical ranges via σ.
-            beta  = _sigmoid_range(v[0], 0.5, 2.0).item()
-            gamma = _sigmoid_range(v[1], 0.0, 0.9).item()
-            clamp = _sigmoid_range(v[2], 1.0, 10.0).item()
+            beta  = float(_sigmoid_range(v[0], *r["beta"]))
+            gamma = float(_sigmoid_range(v[1], *r["gamma"]))
+            clamp = float(_sigmoid_range(v[2], *r["clamp"]))
 
-            # Style left unconstrained for adapters (they may tanh/normalize if desired).
-            style = v[3:8].detach()
+            # Style block (unconstrained raw + normalized helper for UI sliders)
+            style_vec = v[3:8].detach().cpu()
+            style = [float(x) for x in style_vec.tolist()]
+            out: Dict[str, object] = {"beta": beta, "gamma": gamma, "clamp": clamp, "style": style}
 
-        return {"beta": beta, "gamma": gamma, "clamp": clamp, "style": style}
+            if include_style_norm:
+                # normalized to [-1,1] for immediate UI use
+                s_norm = _tanh_range(style_vec, -1.0, 1.0).tolist()
+                out["style_norm"] = [float(x) for x in s_norm]
+
+        return out
+
+    @staticmethod
+    def describe(v: torch.Tensor, rails: Optional[Dict[str, Tuple[float, float]]] = None) -> str:
+        """
+        Human‑readable one‑liner for logs/Studio:
+            "β=1.26  γ=0.43  ⛔=5.7  |  style≈[+0.31, −0.12, +0.04, +0.77, −0.05]"
+        """
+        p = SteeringController.to_params(v, rails=rails, include_style_norm=True)
+        s = p.get("style_norm") or p.get("style") or []
+        fmt = lambda x: f"{x:+.2f}"
+        s_preview = ", ".join(fmt(x) for x in (s[:5] if isinstance(s, list) else []))
+        return f"β={p['beta']:.2f}  γ={p['gamma']:.2f}  ⛔={p['clamp']:.1f}  |  style≈[{s_preview}]"
 
     # ————————————————————————————————————————————————
     # Convenience factories (untrained vs. checkpoint)
     # ————————————————————————————————————————————————
     @classmethod
-    def load_default(cls, delta: float = 0.030908106561043047) -> "SteeringController":
+    def load_default(cls, delta: float = 0.030908106561043047, vocab: int = 256) -> "SteeringController":
         """
         Create a fresh, untrained controller (useful for prototyping).
         Training lives in steering_train.py.
         """
-        return cls(delta)
+        return cls(delta, vocab=vocab)
 
     @classmethod
-    def load(cls, path: str, delta: float = 0.030908106561043047) -> "SteeringController":
+    def load(cls, path: str, delta: float = 0.030908106561043047, vocab: int = 256) -> "SteeringController":
         """
         Load weights from a state_dict checkpoint at `path`. Returns the controller in eval mode.
         """
-        m = cls(delta)
+        m = cls(delta, vocab=vocab)
         sd = torch.load(path, map_location="cpu")
         m.load_state_dict(sd)
         m.eval()
@@ -156,7 +202,8 @@ class SteeringController(nn.Module):  # 🎚 intent → (β, γ, ⛔, style₅)
     # ————————————————————————————————————————————————
     # Optional: apply controls to a model directly
     # ————————————————————————————————————————————————
-    def apply_to_model(self, model, s: str | None = None, v: torch.Tensor | None = None) -> Dict[str, object]:
+    def apply_to_model(self, model, s: str | None = None, v: torch.Tensor | None = None,
+                       rails: Optional[Dict[str, Tuple[float, float]]] = None) -> Dict[str, object]:
         """
         Produce controls (from a prompt `s` or raw vector `v`) and push them
         into any model that implements `.apply_control(beta=?, gamma=?, clamp=?)`.
@@ -168,7 +215,8 @@ class SteeringController(nn.Module):  # 🎚 intent → (β, γ, ⛔, style₅)
             if s is None:
                 raise ValueError("either `s` (prompt) or `v` (raw ℝ⁸ vector) must be provided")
             v = self.forward(s)
-        params = self.to_params(v)
+
+        params = self.to_params(v, rails=rails or {"beta": (0.5, 2.0), "gamma": (0.0, 0.9), "clamp": (1.0, 10.0)})
         if hasattr(model, "apply_control"):
             model.apply_control(beta=params["beta"], gamma=params["gamma"], clamp=params["clamp"])
         return params
