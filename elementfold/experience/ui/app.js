@@ -9,6 +9,9 @@
        if an element with id="predBadges" exists (optional).
      • Safer error handling + Ctrl+Enter to send /steer and /infer.
      • Optional "relax" block for /infer if advanced inputs are present.
+     • NEW: telemetry polling for /telemetry/state and /telemetry/counsel,
+       with caption, bullets, numbers snapshot, and clickable next_actions.
+     • Auto-populate adapter list from GET /adapters (if <select id="modality"> exists).
    ────────────────────────────────────────────────────────────────────────── */
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -62,6 +65,18 @@ const btnDeltaSet   = el("btnDeltaSet");
 const predBadges    = el("predBadges");    // container for ℱ / z / A badges (optional)
 const adapterStatus = el("adapterStatus"); // optional compact status line
 
+// NEW: Telemetry/Counsel panel (all optional)
+const teleCaption   = el("teleCaption");   // one-line caption from /telemetry/counsel
+const teleBullets   = el("teleBullets");   // <ul> container for bullet <li>
+const teleNumbers   = el("teleNumbers");   // <pre> or <code> to show numbers snapshot
+const teleActions   = el("teleActions");   // container for "chips" (next_actions)
+const teleConfidence= el("teleConfidence");// small text: confidence + band
+const teleTs        = el("teleTs");        // last fetch timestamp
+const teleLLM       = el("teleLLM");       // shows "LLM: on/off"
+const btnTeleStart  = el("btnTeleStart");
+const btnTeleStop   = el("btnTeleStop");
+const teleEveryMs   = el("teleEveryMs");   // <input type=number> poll ms
+
 // ──────────────────────────────────────────────────────────────────────────
 // HTTP helpers
 // ──────────────────────────────────────────────────────────────────────────
@@ -84,13 +99,20 @@ async function get(path) {
   return res;
 }
 
+async function getJSON(path) {
+  const res = await get(path);
+  return await res.json();
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Health
 // ──────────────────────────────────────────────────────────────────────────
 async function onHealth() {
   try {
-    const res = await get("/health");
-    statusEl && (statusEl.textContent = res.ok ? "status: ✓ healthy" : "status: ✖ unhealthy");
+    const body = await getJSON("/health");
+    const dev = body?.device || "unknown";
+    const ready = body?.model_ready ? "✓ model" : "… training on demand";
+    statusEl && (statusEl.textContent = `status: ✓ healthy • ${dev} • ${ready}`);
   } catch (e) {
     statusEl && (statusEl.textContent = `status: ✖ cannot reach /health (${e.message})`);
   }
@@ -318,6 +340,125 @@ async function onDeltaSet() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Telemetry: polling /telemetry/state and /telemetry/counsel
+// ──────────────────────────────────────────────────────────────────────────
+let _teleTimer = null;
+let _teleBusy = false;
+
+function setTeleStatus(ts, llmUsed, conf) {
+  if (teleTs)        teleTs.textContent = ts ? new Date(ts * 1000).toLocaleTimeString() : "";
+  if (teleLLM)       teleLLM.textContent = llmUsed ? "LLM: on" : "LLM: off";
+  if (teleConfidence) teleConfidence.textContent = (typeof conf === "number")
+      ? `confidence: ${(conf * 100).toFixed(0)}%`
+      : "";
+}
+
+function renderCounsel(c) {
+  if (!c || typeof c !== "object") return;
+  if (teleCaption)  teleCaption.textContent = c.caption || "—";
+  if (teleNumbers)  teleNumbers.textContent = JSON.stringify(c.numbers || {}, null, 2);
+
+  if (teleBullets) {
+    teleBullets.innerHTML = "";
+    const arr = Array.isArray(c.bullets) ? c.bullets : [];
+    for (const b of arr.slice(0, 6)) {
+      const li = document.createElement("li");
+      li.textContent = String(b);
+      teleBullets.appendChild(li);
+    }
+  }
+
+  if (teleActions) {
+    teleActions.innerHTML = "";
+    const acts = Array.isArray(c.next_actions) ? c.next_actions : [];
+    for (const a of acts.slice(0, 4)) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.textContent = a;
+      chip.className = "chip"; // style in your CSS
+      chip.addEventListener("click", async () => {
+        const modality = modalitySel?.value || "language";
+        try {
+          const out = await steer(modality, a);
+          renderSteerPayload(out);
+        } catch (e) {
+          if (steerOut) steerOut.textContent = `error: ${e.message}`;
+        }
+      });
+      teleActions.appendChild(chip);
+    }
+  }
+
+  setTeleStatus(Date.now() / 1000, c.llm_used, c.confidence);
+}
+
+function renderTeleState(s) {
+  // s = { telemetry: {...}, ts: <unix seconds> }
+  if (!s || typeof s !== "object") return;
+  const tele = s.telemetry || {};
+  if (teleNumbers) {
+    // If counsel numbers will overwrite later, this still provides a raw view first.
+    teleNumbers.textContent = JSON.stringify(tele, null, 2);
+  }
+  setTeleStatus(s.ts, undefined, undefined);
+}
+
+async function refreshTelemetry() {
+  if (_teleBusy) return;
+  _teleBusy = true;
+  try {
+    const [stateRes, counselRes] = await Promise.allSettled([
+      getJSON("/telemetry/state"),
+      getJSON("/telemetry/counsel"),
+    ]);
+
+    if (stateRes.status === "fulfilled") {
+      renderTeleState(stateRes.value);
+    }
+    if (counselRes.status === "fulfilled") {
+      renderCounsel(counselRes.value);
+    }
+  } catch (_) {
+    // swallow; page shows last values
+  } finally {
+    _teleBusy = false;
+  }
+}
+
+function startTelemetry() {
+  if (_teleTimer) return;
+  const ms = Math.max(300, parseInt((teleEveryMs?.value || "1200"), 10) || 1200);
+  _teleTimer = setInterval(refreshTelemetry, ms);
+  refreshTelemetry();
+}
+
+function stopTelemetry() {
+  if (_teleTimer) {
+    clearInterval(_teleTimer);
+    _teleTimer = null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+/** Populate adapters into the modality select (optional). */
+async function refreshAdapters() {
+  if (!modalitySel) return;
+  try {
+    const body = await getJSON("/adapters");
+    const names = Array.isArray(body?.adapters) ? body.adapters : [];
+    if (!names.length) return;
+    const current = new Set([...modalitySel.querySelectorAll("option")].map(o => o.value));
+    for (const n of names) {
+      if (current.has(n)) continue;
+      const opt = document.createElement("option");
+      opt.value = n;
+      opt.textContent = n;
+      modalitySel.appendChild(opt);
+    }
+  } catch (_) {}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Wire up events
 // ──────────────────────────────────────────────────────────────────────────
 on(btnHealth, "click", onHealth);
@@ -349,5 +490,16 @@ on(btnDown   , "click", onDown);
 on(driverSel , "change", onDriverChange);
 on(btnDeltaSet, "click", onDeltaSet);
 
-// Do an initial health ping on load
+// Telemetry panel controls (optional)
+on(btnTeleStart, "click", startTelemetry);
+on(btnTeleStop , "click", stopTelemetry);
+on(teleEveryMs , "change", () => {
+  if (_teleTimer) { stopTelemetry(); startTelemetry(); }
+});
+
+// Do an initial health ping on load, populate adapters, and start telemetry if a container exists.
 onHealth();
+refreshAdapters();
+if (teleCaption || teleBullets || teleNumbers || teleActions) {
+  startTelemetry();
+}
