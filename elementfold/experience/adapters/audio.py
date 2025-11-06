@@ -1,5 +1,6 @@
 # ElementFold · experience/adapters/audio.py
-# Audio adapter = bridge from (model, prompt, style) → {wav_b64, tokens, sr, duration_sec}.
+# Audio adapter = bridge from (model, prompt, style) → JSON payload suitable for the UI.
+#
 # Contract with the registry:
 #   factory = AdapterRegistry.get("audio")
 #   runner  = factory()                                # zero‑arg → callable
@@ -8,15 +9,16 @@
 # Behavior (plain words):
 #   • Optionally apply steering controls (β exposure, γ damping, ⛔ clamp) from a raw ℝ⁸ style vector or a dict.
 #   • Accept prompt as str or dict; parse generation hints (sr / seconds / len) safely.
-#   • Tokenize the prompt to build a seed batch of length T (clamped to the model’s seq_len).
-#   • Decode tokens via the shared infer_loop ('greedy' by default, supports sampling).
-#   • Convert tokens into unsigned 8‑bit PCM WAV (mono) in memory and return base64 + a data URL.
+#   • Tokenize the prompt to build a seed batch of length T (clamped to model.seq_len).
+#   • Decode tokens via the shared infer_loop ('greedy' by default; 'sample' is available).
+#   • Convert tokens into unsigned 8‑bit PCM WAV (mono) in memory and return both base64 and a data URL.
+#   • Make predictions visible: include a one‑line caption summarizing β/γ/⛔ and decode knobs.
 #
 # Why 8‑bit PCM?  It matches the project’s byte‑level tokenization in datasets/audio_folder.py:
 #   training maps floats in [−1,1] → uint8 [0,255]. We reverse that for simple synthesis.
 
 from __future__ import annotations
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 import base64           # base64 encoding for JSON transport
 import io               # in‑memory WAV buffers
@@ -29,7 +31,7 @@ from .base import AdapterRegistry                         # 🗂 adapter registr
 from elementfold.tokenizer import SimpleTokenizer         # ✴ tiny byte tokenizer
 from elementfold.infer import infer_loop                  # ✴ unified decoding path across adapters
 
-# Optional steering support: map raw ℝ⁸ → {'beta','gamma','clamp','style'}
+# Optional steering support: map raw ℝ⁸ → {'beta','gamma','clamp','style'}; optional caption via describe()
 try:
     from ..steering import SteeringController             # 🎚 intent → control vector (and to_params)
     _HAS_STEER = True
@@ -41,47 +43,69 @@ except Exception:
 # Style → model control (β, γ, ⛔); accept dicts or raw vectors
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _apply_style_to_model(model, style) -> Dict[str, float]:
+def _map_style_to_params(style: Any) -> Optional[Dict[str, float]]:
     """
-    If `style` is a dict with keys beta/gamma/clamp, apply them directly.
-    If `style` looks like the raw ℝ⁸ vector from SteeringController, map via to_params().
-    If the model exposes .apply_control(beta=?, gamma=?, clamp=?), push controls in.
-    Return the dict actually applied (or {} if nothing applied).
+    Accept either:
+      • dict with {'beta','gamma','clamp'} floats,
+      • raw ℝ⁸ vector (Tensor/list/tuple) from SteeringController → map via to_params(),
+    and return a clean params dict or None.
     """
-    params: Dict[str, float] | None = None
-
-    # Case A: explicit dictionary
     if isinstance(style, dict) and all(k in style for k in ("beta", "gamma", "clamp")):
         try:
-            params = {
+            return {
                 "beta": float(style["beta"]),
                 "gamma": float(style["gamma"]),
                 "clamp": float(style["clamp"]),
             }
         except Exception:
-            params = None  # Ignore malformed inputs silently (adapter remains usable)
+            return None
 
-    # Case B: raw vector from SteeringController (ℝ⁸)
-    elif _HAS_STEER and isinstance(style, (torch.Tensor, list, tuple)) and len(style) >= 3:
-        v = torch.as_tensor(style, dtype=torch.float32)
+    if _HAS_STEER and isinstance(style, (torch.Tensor, list, tuple)) and len(style) >= 3:
         try:
+            v = torch.as_tensor(style, dtype=torch.float32)
             mapped = SteeringController.to_params(v)  # → {'beta','gamma','clamp','style'}
-            params = {
-                "beta": float(mapped["beta"]),
-                "gamma": float(mapped["gamma"]),
-                "clamp": float(mapped["clamp"]),
-            }
+            return {"beta": float(mapped["beta"]),
+                    "gamma": float(mapped["gamma"]),
+                    "clamp": float(mapped["clamp"])}
         except Exception:
-            params = None
+            return None
 
-    # Push into the model if supported
+    return None
+
+
+def _apply_style_to_model(model, style) -> Dict[str, float]:
+    """
+    Determine controls from `style` and, if the model supports it, apply:
+        model.apply_control(beta=?, gamma=?, clamp=?)
+    Returns the dict actually applied (or {}).
+    """
+    params = _map_style_to_params(style)
     if params and hasattr(model, "apply_control"):
         try:
             model.apply_control(beta=params["beta"], gamma=params["gamma"], clamp=params["clamp"])
         except Exception:
-            pass  # Non‑fatal: ignore if model lacks the expected hook signature
-
+            pass  # Non‑fatal: model might not implement the exact signature
     return params or {}
+
+
+def _summarize_style(style: Any, params: Dict[str, float]) -> str:
+    """
+    Human‑friendly single line. Prefer SteeringController.describe(raw ℝ⁸) when available;
+    otherwise fall back to the applied params. Returns "" if nothing to say.
+    """
+    if _HAS_STEER and isinstance(style, (torch.Tensor, list, tuple)) and len(style) >= 3:
+        try:
+            v = torch.as_tensor(style, dtype=torch.float32)
+            # SteeringController.describe(...) is optional; fall back on failure.
+            if hasattr(SteeringController, "describe"):
+                return SteeringController.describe(v)  # e.g., "β=1.26  γ=0.43  ⛔=5.7  |  style≈[...]"
+        except Exception:
+            pass
+
+    if params:
+        return f"β={params['beta']:.2f}  γ={params['gamma']:.2f}  ⛔={params['clamp']:.1f}"
+
+    return ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -104,30 +128,27 @@ def _parse_prompt_hints(s_or_dict: Any, default_sr: int, default_len: int) -> Tu
     sr = int(default_sr)
     length = int(default_len)
 
-    # Dict path (preferred when caller can structure the request)
+    # Dict path (structured)
     if isinstance(s_or_dict, dict):
-        def _get_num(key):
-            v = s_or_dict.get(key)
-            if v is None:
-                return None
+        def _num(x):
             try:
-                return float(v)
+                return None if x is None else float(x)
             except Exception:
                 return None
 
-        sr_from_dict = _get_num("sr") or _get_num("sample_rate")
+        sr_from_dict = _num(s_or_dict.get("sr")) or _num(s_or_dict.get("sample_rate"))
         if sr_from_dict is not None:
             sr = int(sr_from_dict)
 
-        seconds_from_dict = _get_num("seconds") or _get_num("sec")
+        seconds_from_dict = _num(s_or_dict.get("seconds")) or _num(s_or_dict.get("sec"))
         if seconds_from_dict is not None:
             length = int(max(1, round(sr * float(seconds_from_dict))))
 
-        len_from_dict = _get_num("len") or _get_num("length")
+        len_from_dict = _num(s_or_dict.get("len")) or _num(s_or_dict.get("length"))
         if len_from_dict is not None:
             length = int(len_from_dict)
 
-    # String path (back‑compat, quick experiments)
+    # String path (back‑compat / quick experiments)
     elif isinstance(s_or_dict, str):
         for key, val in _HINT_RE.findall(s_or_dict):
             key_l = key.lower()
@@ -138,8 +159,7 @@ def _parse_prompt_hints(s_or_dict: Any, default_sr: int, default_len: int) -> Tu
                     pass
             elif key_l in ("seconds", "sec"):
                 try:
-                    sec = float(val)
-                    length = int(max(1, round(sr * sec)))
+                    length = int(max(1, round(sr * float(val))))
                 except Exception:
                     pass
             elif key_l in ("len", "length"):
@@ -148,7 +168,7 @@ def _parse_prompt_hints(s_or_dict: Any, default_sr: int, default_len: int) -> Tu
                 except Exception:
                     pass
 
-    # Clamp to safe bounds (keeps memory stable and WAV sane)
+    # Rails: keep memory stable and WAV sane
     sr = int(max(8000, min(48000, sr)))          # 8 kHz … 48 kHz
     length = int(max(1, min(4 * sr, length)))    # up to ~4 seconds by default
     return sr, length
@@ -163,9 +183,8 @@ def _tokens_to_wav_b64(tokens: torch.Tensor, sample_rate: int) -> Tuple[str, flo
     Take a 1‑D LongTensor (values 0..255), write an unsigned 8‑bit mono WAV into memory,
     and return (base64_string, duration_sec).
     """
-    # Ensure contiguous 1‑D uint8 on CPU for wave.writeframes
     q = tokens.to(torch.uint8).contiguous().view(-1).cpu()   # bytes in [0,255]
-    duration = float(q.numel()) / float(sample_rate)         # seconds = samples / sr
+    duration = float(q.numel()) / float(sample_rate)
 
     bio = io.BytesIO()
     with wave.open(bio, "wb") as w:
@@ -188,16 +207,16 @@ def _run(model, prompt, style):
     2) Parse prompt hints (sr=…, seconds=…, len=…) from str or dict.
     3) Build an input token batch (seed) of requested length T, clamped to model.seq_len.
     4) Decode via infer_loop (strategy='greedy' unless overridden in prompt dict['decode']).
-    5) Pack tokens into a base64 WAV and return a JSON‑friendly dict.
+    5) Pack tokens into a base64 WAV and return a JSON‑friendly dict with a human caption.
     """
     # 1) Steering (no‑op if style is None or model lacks apply_control)
     applied = _apply_style_to_model(model, style)
+    caption = _summarize_style(style, applied)
 
     # 2) Determine target length and sample rate from prompt hints
     T_default = int(getattr(model, "seq_len", 128))  # model’s configured max length
     sr, T_req = _parse_prompt_hints(prompt, default_sr=16000, default_len=T_default)
-    # Always respect the model’s maximum sequence length
-    T = int(min(T_req, T_default))
+    T = int(min(T_req, T_default))                   # always respect model’s max
 
     # 3) Prepare seed token batch from prompt text (for dict: use prompt.get("text", ""))
     tok = SimpleTokenizer()
@@ -223,8 +242,8 @@ def _run(model, prompt, style):
     # Allow dict prompts to pass decoding knobs: {'decode': {'strategy': 'sample', 'temperature': 0.8, ...}}
     strategy = "greedy"
     temperature = 1.0
-    top_k = None
-    top_p = None
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
     if isinstance(prompt, dict):
         dec = prompt.get("decode", {})
         if isinstance(dec, dict):
@@ -261,12 +280,19 @@ def _run(model, prompt, style):
     # 5) Pack into WAV and return payload
     wav_b64, duration = _tokens_to_wav_b64(q, sample_rate=sr)
     return {
-        "wav_b64": wav_b64,                             # base64 WAV (mono, 8‑bit)
-        "data_url": f"data:audio/wav;base64,{wav_b64}", # handy for browsers
-        "tokens": q.tolist(),                           # decoded token sequence (ints 0..255)
-        "sr": int(sr),                                  # sample rate
-        "duration_sec": float(duration),                # seconds
-        "applied": applied,                             # {'beta','gamma','clamp'} if steering was applied
+        "wav_b64": wav_b64,                              # base64 WAV (mono, 8‑bit)
+        "data_url": f"data:audio/wav;base64,{wav_b64}",  # handy for browsers
+        "tokens": q.tolist(),                            # decoded token sequence (ints 0..255)
+        "sr": int(sr),                                   # sample rate
+        "duration_sec": float(duration),                 # seconds
+        "applied": applied,                              # {'beta','gamma','clamp'} if steering was applied
+        "decode": {                                      # echo knobs for traceability
+            "strategy": strategy,
+            "temperature": float(temperature),
+            "top_k": (int(top_k) if top_k is not None else None),
+            "top_p": (float(top_p) if top_p is not None else None),
+        },
+        "caption": caption,                              # human‑readable summary (β/γ/⛔, style sketch)
     }
 
 
