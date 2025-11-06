@@ -8,76 +8,106 @@
 #
 # What it does (plain words):
 #   1) (Optional) Apply steering controls (β exposure, γ damping, ⛔ clamp)
-#      to the model when a raw ℝ⁸ style vector is provided.
+#      to the model when a raw ℝ⁸ style vector is provided, or a dict with
+#      those controls is given.
 #   2) Tokenize the prompt into byte‑ids (vocab≈256).
 #   3) Run a single forward pass and greedy‑decode logits to tokens.
 #   4) Detokenize back to text and return it.
 #
-# The “style” input is usually the raw ℝ⁸ from SteeringController:
-#     v = [β̂, γ̂, ⛔̂, style₅]
-# We map it into meaningful ranges and forward (β,γ,⛔) to the model.
+# Visibility: when steering is used, we also prepend a single‑line summary:
+#   "β=1.26  γ=0.43  ⛔=5.7  |  style≈[+0.31, −0.12, +0.04, +0.77, −0.05]"
+# so predictions are “visible and explained” in Studio logs/UX.
+#
 # Adapters are intentionally tiny so they’re easy to read and replace.
 
 from __future__ import annotations
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 
 from .base import AdapterRegistry                     # 🗂 adapter registry
 from elementfold.tokenizer import SimpleTokenizer     # ✴ tiny byte tokenizer
 
-# Optional import: used to map raw ℝ⁸ into (beta, gamma, clamp).
+# Optional import: used to map raw ℝ⁸ into (beta, gamma, clamp) and summarize.
 try:
-    from ..steering import SteeringController         # 🎚 intent → control vector (and to_params)
+    from ..steering import SteeringController         # 🎚 intent → control vector (and to_params/describe)
     _HAS_STEER = True
 except Exception:                                     # Keep adapter usable even if steering isn’t present
     _HAS_STEER = False
 
 
-def _apply_style_to_model(model: Any, style: Any) -> Dict[str, float]:
-    """
-    If `style` looks like a raw ℝ⁸ vector from the SteeringController, map it to
-    parameters and apply to the model (if it supports .apply_control). If `style`
-    is already a dict with β/γ/⛔, use it directly. Otherwise, do nothing.
+# ———————————————————————————————————————————————————————————
+# Steering helpers
+# ———————————————————————————————————————————————————————————
 
-    Returns the parameters that were applied (or an empty dict when none).
+def _map_style_to_params(style: Any) -> Optional[Dict[str, float]]:
     """
-    params: Dict[str, float] | None = None
-
+    Accept either:
+      • dict with {'beta','gamma','clamp'} floats,
+      • raw ℝ⁸ vector (Tensor/list/tuple) from SteeringController → map via to_params(),
+    and return a clean params dict or None.
+    """
     # Case A: explicit dict {beta,gamma,clamp}
     if isinstance(style, dict) and all(k in style for k in ("beta", "gamma", "clamp")):
         try:
-            params = {
+            return {
                 "beta": float(style["beta"]),
                 "gamma": float(style["gamma"]),
                 "clamp": float(style["clamp"]),
             }
         except Exception:
-            params = None  # fall through to no‑op if values aren’t clean floats
+            return None
 
     # Case B: raw ℝ⁸ (Tensor/list/tuple) from SteeringController
-    elif _HAS_STEER and isinstance(style, (torch.Tensor, list, tuple)) and len(style) >= 3:
-        v = torch.as_tensor(style, dtype=torch.float32)  # normalize dtype/device‑agnostic
+    if _HAS_STEER and isinstance(style, (torch.Tensor, list, tuple)) and len(style) >= 3:
         try:
-            mapped = SteeringController.to_params(v)     # {'beta','gamma','clamp','style'}
-            params = {
-                "beta": float(mapped["beta"]),
-                "gamma": float(mapped["gamma"]),
-                "clamp": float(mapped["clamp"]),
-            }
+            v = torch.as_tensor(style, dtype=torch.float32)
+            mapped = SteeringController.to_params(v)     # {'beta','gamma','clamp','style',...}
+            return {"beta": float(mapped["beta"]),
+                    "gamma": float(mapped["gamma"]),
+                    "clamp": float(mapped["clamp"])}
         except Exception:
-            params = None
+            return None
 
-    # Apply if possible
-    if params is not None and hasattr(model, "apply_control"):
+    # Otherwise: unknown style form
+    return None
+
+
+def _apply_params_to_model(model: Any, params: Optional[Dict[str, float]]) -> None:
+    """Best‑effort application of β/γ/⛔ to models that support .apply_control(...)."""
+    if not params:
+        return
+    if hasattr(model, "apply_control"):
         try:
             model.apply_control(beta=params["beta"], gamma=params["gamma"], clamp=params["clamp"])
         except Exception:
-            # Non‑fatal: ignore if model lacks the expected hook signature
+            # Non‑fatal: ignore if the model’s hook signature differs
             pass
 
-    return params or {}
 
+def _summarize_style(style: Any, params: Optional[Dict[str, float]]) -> str:
+    """
+    Human‑friendly single line. Prefer SteeringController.describe(raw ℝ⁸) when available;
+    otherwise fall back to the applied params. Returns "" if nothing to say.
+    """
+    # Prefer a raw vector summary using SteeringController (shows style preview nicely)
+    if _HAS_STEER and isinstance(style, (torch.Tensor, list, tuple)) and len(style) >= 3:
+        try:
+            v = torch.as_tensor(style, dtype=torch.float32)
+            return SteeringController.describe(v)
+        except Exception:
+            pass
+
+    # Fall back to the applied controls only
+    if params:
+        return f"β={params['beta']:.2f}  γ={params['gamma']:.2f}  ⛔={params['clamp']:.1f}"
+
+    return ""
+
+
+# ———————————————————————————————————————————————————————————
+# Core runner
+# ———————————————————————————————————————————————————————————
 
 def _run(model, prompt: str, style: Any) -> str:
     """
@@ -86,10 +116,13 @@ def _run(model, prompt: str, style: Any) -> str:
       2) encode prompt → ids,
       3) forward once (inference mode),
       4) greedy decode,
-      5) decode ids → text.
+      5) decode ids → text,
+      6) if steering used → prepend a friendly one‑line summary.
     """
     # 1) Steering (safe no‑op if style is None/unsupported)
-    _apply_style_to_model(model, style)
+    params = _map_style_to_params(style)
+    _apply_params_to_model(model, params)
+    summary = _summarize_style(style, params)
 
     # 2) Tokenize the prompt; ensure at least one token for empty strings
     tok = SimpleTokenizer()
@@ -109,8 +142,8 @@ def _run(model, prompt: str, style: Any) -> str:
     was_training = getattr(model, "training", False)
     model.eval()  # polite: disable dropout etc. if present
     with torch.inference_mode():
-        logits, _X = model(x)                       # (1,T',V), (1,T')
-        y = logits.argmax(dim=-1).squeeze(0)        # (T',)
+        logits, _ledger = model(x)                    # (1,T',V), (1,T')
+        y = logits.argmax(dim=-1).squeeze(0)         # (T',)
         out_ids = y.detach().cpu().tolist()
 
     # Restore training state if needed
@@ -121,7 +154,12 @@ def _run(model, prompt: str, style: Any) -> str:
             pass
 
     # 5) Detokenize to text
-    return tok.decode(out_ids)
+    text_out = tok.decode(out_ids)
+
+    # 6) If we have a steering summary, make the output self‑describing
+    if summary:
+        return f"{summary}\n{text_out}"
+    return text_out
 
 
 # — Registry wiring: decorator form keeps definitions concise and thread‑safe —
