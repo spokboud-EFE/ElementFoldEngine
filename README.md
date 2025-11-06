@@ -9,7 +9,7 @@ Discord Channel ---> [SRT DISCORD](https://discord.gg/nzyWctG2)
 
 Theory ---> [EFE Theory](https://doi.org/10.5281/zenodo.17481738)
 
-Legacy (Deprecated) ---> [![DOI](https://zenodo.org/badge/1086358952.svg)](https://doi.org/10.5281/zenodo.17518213)
+[![DOI Deprecated Legacy](https://zenodo.org/badge/1086358952.svg)](https://doi.org/10.5281/zenodo.17518213)
 
 
 
