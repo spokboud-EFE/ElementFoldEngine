@@ -25,22 +25,13 @@
 #   • AdapterRegistry.validate(name, feed) → readiness report for real data
 #   • AdapterRegistry.simulate(name, **kw) → optional simulate() if provided
 #   • AdapterMeta — human‑readable bits (kind/what/why/actions/params)
-#   • with_meta(meta) decorator — attach AdapterMeta (optional but nice)
+#   • with_meta(meta) decorator — attach AdapterMeta (and compat fields)
 #   • AdapterRegistry.meta(name) → AdapterMeta | None
-#
-# Design notes:
-#   • Names are normalized to lowercase (ASCII) for stable CLI UX.
-#   • Errors include close‑match suggestions (handy at the REPL).
-#   • Thread‑safe writes via a simple lock; reads are uncontended.
-#   • Backward‑compatible: existing calls keep working as‑is.
-#   • “Wait for real data” flow: adapters can publish *TensorSpec*s that Studio
-#     can check before calling the runner; if not ready and the adapter supports
-#     simulation, Studio can call simulate() instead.
 #
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 import threading
 import warnings
 import difflib
@@ -66,7 +57,7 @@ class TensorSpec:
       • dtype: torch dtype or a string like 'float32' (we compare by name).
       • device: 'cpu' | 'cuda' | 'any'
     """
-    shape: Tuple[Any, ...] = field(default_factory=tuple)  # e.g. ('B', 'T') or (None, 16000) or (-1, 16000)
+    shape: Tuple[Any, ...] = field(default_factory=tuple)  # e.g. ('B','T') or (None,16000) or (-1,16000)
     dtype: Any = None                                      # torch.dtype | 'float32' | None
     device: str = "any"                                    # 'any' | 'cpu' | 'cuda'
     doc: str = ""                                          # one‑line narrative for help panels
@@ -115,8 +106,10 @@ class AdapterSpec:
             return f"{self.name}: expects ∅ (none); wait={self.wait}"
         parts = [f"{self.name}: wait={self.wait}"]
         for k, spec in self.expects.items():
-            parts.append(f"  • {k}: {spec.shape_str()}  dtype={spec.dtype_str()}  device={spec.device_str()}"
-                         + (f"  — {spec.doc}" if spec.doc else ""))
+            parts.append(
+                f"  • {k}: {spec.shape_str()}  dtype={spec.dtype_str()}  device={spec.device_str()}"
+                + (f"  — {spec.doc}" if spec.doc else "")
+            )
         if self.predicts:
             parts.append("  ↳ predicts:")
             for k, doc in self.predicts.items():
@@ -144,16 +137,40 @@ class AdapterMeta:
     params: Dict[str, str] = field(default_factory=dict)
 
 
-# Small decorators to pin a spec/meta on a factory (no extra machinery needed).
+# ──────────────────────────────────────────────────────────────────────────────
+# Decorators to pin spec/meta on a factory (and compat fields for Studio)
+# ──────────────────────────────────────────────────────────────────────────────
+
 def with_spec(spec: AdapterSpec) -> Callable[[Callable[[], Callable]], Callable[[], Callable]]:
     def _decor(factory: Callable[[], Callable]) -> Callable[[], Callable]:
         setattr(factory, "__adapter_spec__", spec)
+        # Back‑compat convenience for UIs that read .DESCRIPTION directly
+        if spec.description and not getattr(factory, "DESCRIPTION", None):
+            try:
+                setattr(factory, "DESCRIPTION", spec.description)
+            except Exception:
+                pass
         return factory
     return _decor
 
 def with_meta(meta: AdapterMeta) -> Callable[[Callable[[], Callable]], Callable[[], Callable]]:
+    """
+    Attach human‑readable metadata. For backward compatibility with older Studio
+    builds that look for factory.KIND / factory.DESCRIPTION, we also mirror fields.
+    """
     def _decor(factory: Callable[[], Callable]) -> Callable[[], Callable]:
         setattr(factory, "__adapter_meta__", meta)
+        # Back‑compat: mirror fields so older UIs keep working
+        try: setattr(factory, "KIND", meta.kind)
+        except Exception: pass
+        # Prefer 'what' as the short description shown in lists
+        short_desc = meta.what or meta.why or ""
+        try: setattr(factory, "DESCRIPTION", short_desc)
+        except Exception: pass
+        # Optional lowercase alias some code may use
+        if not getattr(factory, "description", None):
+            try: setattr(factory, "description", short_desc)
+            except Exception: pass
         return factory
     return _decor
 
@@ -356,7 +373,6 @@ class AdapterRegistry:
             avail = sorted(cls._reg.keys())
             hint = ""
             if avail:
-                # Suggest up to 3 close matches (threshold tuned for short names)
                 matches = difflib.get_close_matches(key, avail, n=3, cutoff=0.6)
                 if matches:
                     hint = f"  did you mean: {', '.join(matches)}?"
@@ -399,7 +415,7 @@ class AdapterRegistry:
     def __contains__(self, name: str) -> bool:  # Allows: "language" in AdapterRegistry
         return self.has(name)
 
-    def __len__(self) -> bool:  # How many adapters are registered?
+    def __len__(self) -> int:  # How many adapters are registered?
         return len(self._reg)
 
     # ────────────────────────────────────────────────────────────────────────
