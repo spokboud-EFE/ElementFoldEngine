@@ -1,125 +1,119 @@
 # ElementFold · utils/bootstrap.py
 # ============================================================
-# Simulation bootstrap utility
+# RAM-only "brain" bootstrap
 # ------------------------------------------------------------
-# Purpose:
-#   • Create a run directory and default config if missing.
-#   • Optionally prompt for physical parameters (λ, D, steps).
-#   • Optionally verify remote monitor or dashboard connection.
-#   • Never writes outside the run folder; no global side effects.
+#  • Prompts for remote brain credentials (Ollama / OpenAI)
+#  • Verifies connectivity with a quick JSON ping
+#  • Stores values in os.environ (session only)
 # ============================================================
 
 from __future__ import annotations
-import os, json, sys, time
-from typing import Dict, Optional
+import json, os, urllib.request, urllib.error
+from typing import Dict, Optional, Tuple
 
-try:
-    from .display import info, warn, success, section
-except Exception:  # fallback for early bootstrap
-    def info(x: str): print(x)
-    def warn(x: str): print("WARN:", x)
-    def success(x: str): print("OK:", x)
-    def section(x: str): print(f"\n== {x} ==")
+PING_TIMEOUT = 6.0
 
-from .config import Config
-from .io import ensure_dir, write_json
+# ------------------------------------------------------------
+# HTTP helper
+# ------------------------------------------------------------
+def _post_json(url: str, payload: Dict, timeout: float,
+               headers: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec
+        return r.getcode(), r.read().decode("utf-8", errors="replace")
 
-
-# ============================================================
-# 1. Helpers
-# ============================================================
-
-def _isatty() -> bool:
+# ------------------------------------------------------------
+# Ping helpers
+# ------------------------------------------------------------
+def _ping_ollama(base_url: str, model: str) -> bool:
+    url = base_url.rstrip("/") + "/api/chat"
+    payload = {
+        "model": model, "stream": False,
+        "messages": [{"role": "user", "content": "ping"}],
+        "options": {"temperature": 0.0, "num_predict": 1}
+    }
     try:
-        return sys.stdin.isatty()
+        code, _ = _post_json(url, payload, PING_TIMEOUT)
+        return 200 <= code < 300
     except Exception:
         return False
 
+def _ping_openai(base_url: str, model: str, api_key: Optional[str]) -> bool:
+    url = base_url.rstrip("/") + "/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0.0, "max_tokens": 1
+    }
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        code, _ = _post_json(url, payload, PING_TIMEOUT, headers=headers)
+        return 200 <= code < 300
+    except Exception:
+        return False
 
+# ------------------------------------------------------------
+# Interactive helpers
+# ------------------------------------------------------------
 def _ask(prompt: str, default: Optional[str] = None) -> str:
-    if not _isatty():
-        return default or ""
     try:
         s = input(prompt).strip()
-        return s if s else (default or "")
+        return s or (default or "")
     except EOFError:
         return default or ""
 
-
 def _confirm(prompt: str, default: bool = False) -> bool:
-    if not _isatty():
-        return default
     suffix = " [Y/n]:" if default else " [y/N]:"
-    s = _ask(prompt + suffix, None).lower()
-    if s == "" and default:
-        return True
+    s = _ask(prompt + suffix, "").lower()
+    if not s:
+        return default
     return s in {"y", "yes"}
 
+# ------------------------------------------------------------
+# Public entry point
+# ------------------------------------------------------------
+def bootstrap_brain_env(*, interactive: bool = True, force_prompt: bool = False) -> None:
+    """Ask for or auto-set remote brain credentials, stored in os.environ only."""
+    # skip if already set
+    if not force_prompt and all(
+        os.environ.get(k) for k in ("PILOT_REMOTE_KIND", "PILOT_REMOTE_URL", "PILOT_REMOTE_MODEL")
+    ):
+        return
 
-# ============================================================
-# 2. Main entry
-# ============================================================
+    if not interactive:
+        return
 
-def bootstrap_sim_env(path: str = "runs/default", interactive: bool = True) -> Config:
-    """
-    Initialize a simulation directory and return its Config.
+    print("No remote brain configured.")
+    if not _confirm("Connect a remote brain now?", default=True):
+        print("Continuing with local brain only.")
+        return
 
-    Behavior:
-      • If path/config.json exists → load it.
-      • Else create a default config interactively or with defaults.
-      • Return Config instance ready for Engine or simulate_once().
-    """
-    section("Simulation Environment Bootstrap")
+    kind = _ask("Remote kind (ollama/openai) [ollama]: ", "ollama").lower()
+    while kind not in {"ollama", "openai"}:
+        kind = _ask("Please enter 'ollama' or 'openai' [ollama]: ", "ollama").lower()
 
-    cfg_path = os.path.join(path, "config.json")
-    ensure_dir(cfg_path)
+    host = _ask("Brain host or base URL [http://127.0.0.1:11434]: ", "http://127.0.0.1:11434")
+    model = _ask("Model name/tag [llama3:8b-instruct]: ", "llama3:8b-instruct")
+    api_key = ""
+    if kind == "openai":
+        api_key = _ask("API key (press Enter to skip): ", "")
 
-    if os.path.exists(cfg_path):
-        info(f"Found existing config at {cfg_path}")
-        cfg = Config.load(cfg_path)
-        return cfg
+    print(f"Verifying {kind} brain at {host} ...")
+    ok = _ping_ollama(host, model) if kind == "ollama" else _ping_openai(host, model, api_key)
+    if not ok:
+        print("⚠ Connection failed. Continuing without remote brain.")
+        return
 
-    if not interactive or not _isatty():
-        cfg = Config()
-        cfg.save(cfg_path)
-        success(f"Created default config at {cfg_path}")
-        return cfg
+    os.environ["PILOT_REMOTE_KIND"] = kind
+    os.environ["PILOT_REMOTE_URL"] = host
+    os.environ["PILOT_REMOTE_MODEL"] = model
+    os.environ["PILOT_PREFER_REMOTE"] = "1"
+    if api_key:
+        os.environ["PILOT_REMOTE_API_KEY"] = api_key
 
-    info("No configuration found; let's create one interactively.")
-    lam = float(_ask("λ (letting-go rate) [0.33]: ", "0.33") or 0.33)
-    D = float(_ask("D (diffusion strength) [0.15]: ", "0.15") or 0.15)
-    steps = int(_ask("Steps per run [100]: ", "100") or 100)
-    grid = int(_ask("Grid size N×N [64]: ", "64") or 64)
-    phi_inf = float(_ask("Baseline Φ∞ [0.0]: ", "0.0") or 0.0)
-
-    cfg = Config(lambda_=lam, D=D, steps=steps, grid=(grid, grid), phi_inf=phi_inf)
-    cfg.save(cfg_path)
-    success(f"Saved configuration to {cfg_path}")
-    info(json.dumps(cfg.to_dict(), indent=2))
-
-    # Optional: connect to remote dashboard
-    if _confirm("Attempt to contact remote monitor/dashboard?", default=False):
-        try:
-            from urllib.request import urlopen
-            url = os.environ.get("ELEMENTFOLD_MONITOR", "http://localhost:8080/health")
-            info(f"Pinging {url} ...")
-            with urlopen(url, timeout=5) as r:  # nosec B310 (stdlib only)
-                if 200 <= r.getcode() < 300:
-                    success("Dashboard reachable")
-                else:
-                    warn(f"HTTP {r.getcode()}")
-        except Exception as e:
-            warn(f"Monitor unreachable: {e}")
-
-    return cfg
-
-
-# ============================================================
-# 3. CLI
-# ============================================================
-
-if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "runs/default"
-    cfg = bootstrap_sim_env(path)
-    print("\n✅ Ready. Configuration summary:")
-    print(json.dumps(cfg.to_dict(), indent=2))
+    print(f"🧩 Connected to brain at {host} ({kind}:{model}) — session env set in RAM.")

@@ -58,6 +58,14 @@ def _model() -> RelaxationModel:
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler, BrainHandlerMixin, BrainLoopHandlerMixin):
+    def _engine(self):
+        """Return the shared global RelaxationModel instance."""
+        try:
+            return _model()   # reuse the singleton defined at the top
+        except Exception as e:
+            print("[server] Engine init failed:", e)
+            return None
+
 
     def _set_headers(self, status: int = 200, content_type: str = "application/json") -> None:
         self.send_response(status)
@@ -183,6 +191,9 @@ def main() -> None:
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=8081)
     args = p.parse_args()
+
+    from .utils.bootstrap import bootstrap_brain_env
+    bootstrap_brain_env(interactive=True)
 
     srv = HTTPServer((args.host, args.port), Handler)
     print(f"⟲ ElementFold physics server ready at http://{args.host}:{args.port}")
