@@ -20,12 +20,12 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
-from .model import Model
+from .core.model import Model
 from .align import AlignHead
-from .variational import VariationalLedger
-from .telemetry import measure
+from .core.variational import VariationalLedger
+from .core.telemetry import measure
 from .optim import build_optimizer, make_scheduler, get_lr
-from .control import Supervisor
+from .core.control import Supervisor
 from .data import DataLoaderBuilder
 from .rung_controller import RungController, RungIntent
 

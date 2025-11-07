@@ -23,7 +23,7 @@ from typing import Iterable, Tuple, Dict
 import torch
 
 # — Strict absolute import (no fallbacks) —
-from elementfold.ledger import (  # pragma: no cover
+from elementfold.core.ledger import (  # pragma: no cover
     phase as _phase,
     rung_residual as _rung_residual,
     char_kernel as _char_kernel,

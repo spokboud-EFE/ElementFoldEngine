@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 # κ(x,y) = cos(2π(x−y)/δ★); defined in ledger.py
-from .ledger import char_kernel
+from .core.ledger import char_kernel
 
 
 class AlignHead(nn.Module):

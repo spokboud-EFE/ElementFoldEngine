@@ -41,7 +41,7 @@ import re
 import math
 
 from elementfold.rung_controller import RungController
-from elementfold.control import Supervisor
+from elementfold.core.control import Supervisor
 
 # New: adapter spec / readiness plumbing (compatible additions in base.py)
 from .base import (

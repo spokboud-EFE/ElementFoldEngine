@@ -42,7 +42,7 @@ import sys
 import time
 
 from . import __version__
-from .runtime import Engine
+from .core.runtime import Engine
 from .tokenizer import SimpleTokenizer
 
 # Optional brain bootstrap (ram‑only env). If missing, we silently skip.

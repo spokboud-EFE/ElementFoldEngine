@@ -34,7 +34,7 @@ import torch
 
 from ..utils.bootstrap import bootstrap_brain_env
 from ..config import Config
-from ..runtime import Engine
+from ..core.runtime import Engine
 
 # Prefer narrative display helpers; fall back to plain logging.
 try:

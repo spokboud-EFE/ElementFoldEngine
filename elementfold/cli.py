@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from .config import Config
-from .runtime import Engine
+from .core.runtime import Engine
 from .tokenizer import SimpleTokenizer
 
 # pretty tables when available

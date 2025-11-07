@@ -24,7 +24,7 @@ from __future__ import annotations
 import threading, difflib
 from typing import Any, Callable, Dict, Tuple
 
-from .model import Model  # canonical ElementFold model
+from .core.model import Model  # canonical ElementFold model
 
 Factory = Callable[..., Any]
 _MODELS: Dict[str, Factory] = {}
