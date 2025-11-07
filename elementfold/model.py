@@ -33,8 +33,9 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
+from typing import Tuple
 
-from .fgn import FGNBlock  # Fold–Gate–Norm building block (must expose either .apply_control(...) or gate/norm params)
+from .fgn import FGNBlock  # Fold–Gate–Norm building block
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -47,10 +48,13 @@ class RotaryClick(nn.Module):
         [A'; B'] = [ cos θ_t  −sin θ_t ] [A; B]
                    [ sin θ_t   cos θ_t ]
     with θ_t = t · (2π·δ⋆). Odd tails (if D is odd) are passed through unchanged.
+
+    Mixed‑precision friendliness: trig is computed in float32 and cast back
+    to the activation dtype to avoid CPU half/bfloat16 limitations.
     """
     def __init__(self, dim: int, delta: float = 0.030908106561043047):
         super().__init__()
-        self.dim   = int(dim)
+        self.dim = int(dim)
         self.theta = 2.0 * math.pi * float(delta)  # θ⋆ = 2π·δ⋆
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -61,24 +65,23 @@ class RotaryClick(nn.Module):
             (B,T,D) rotated features
         """
         B, T, D = x.shape
-        # If we have fewer than 2 lanes, rotation is a no‑op.
         if D < 2:
             return x
 
-        # Use the largest even slice for paired rotation; carry any odd tail.
+        # Largest even slice for paired rotation; carry any odd tail.
         even = (D // 2) * 2
         i0 = torch.arange(0, even, 2, device=x.device)
         i1 = torch.arange(1, even, 2, device=x.device)
 
-        # θ_t for t = 0..T−1 (match dtype/device to x for clean math)
-        angles = torch.arange(T, device=x.device, dtype=x.dtype) * self.theta
-        c = torch.cos(angles).view(1, T, 1)   # (1,T,1)
-        s = torch.sin(angles).view(1, T, 1)   # (1,T,1)
+        # θ_t for t = 0..T−1 in float32 for stable trig on all devices
+        angles_f32 = torch.arange(T, device=x.device, dtype=torch.float32) * self.theta
+        c = torch.cos(angles_f32).to(dtype=x.dtype).view(1, T, 1)  # (1,T,1)
+        s = torch.sin(angles_f32).to(dtype=x.dtype).view(1, T, 1)  # (1,T,1)
 
-        A = x[:, :, i0]                       # (B,T,even/2)
-        Bp = x[:, :, i1]                      # (B,T,even/2)
+        A  = x[:, :, i0]                # (B,T,even/2)
+        Bp = x[:, :, i1]                # (B,T,even/2)
 
-        Ar = A * c - Bp * s                   # rotate pairs in place…
+        Ar = A * c - Bp * s
         Br = A * s + Bp * c
 
         out = x.new_empty(B, T, D)
@@ -107,7 +110,7 @@ class Model(nn.Module):
         layers:  int   = 4,                       # number of FGN blocks
         heads:   int   = 4,                       # kept for config parity (unused here)
         seq_len: int   = 128,                     # max sequence length (for helpers/CLI)
-        fold:    str   = "grid",                  # stylistic knob for FGN families
+        fold:    str   = "grid",                  # stylistic knob for FGN families (carried as metadata)
         delta:   float = 0.030908106561043047,    # δ⋆ click size
     ):
         super().__init__()
@@ -125,6 +128,7 @@ class Model(nn.Module):
         self.rot = RotaryClick(self.d, self.delta)
 
         # — Core: a tidy stack of FGN blocks —
+        # (we do not pass `fold` here to avoid coupling to specific FGN signatures)
         self.blocks = nn.ModuleList([FGNBlock(self.d) for _ in range(self.layers)])
 
         # — Heads: calm output scale then project to logits and ledger —
@@ -140,7 +144,7 @@ class Model(nn.Module):
     # ————————————————————————————————————————————————
     # Forward: (B,T) → (B,T,V) & (B,T)
     # ————————————————————————————————————————————————
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B,T) int64 token ids

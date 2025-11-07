@@ -1,14 +1,8 @@
 # ElementFold · utils/display.py
 # ──────────────────────────────────────────────────────────────────────────────
 # A small, narrative-aware display layer for the console (and a mirror buffer
-# for the Web UI). Keeps the legacy helpers (banner, gauge, progress,
-# format_seconds) while adding color log lines and parameter narration.
-#
-# Design:
-#   • Zero hard deps: uses ANSI; if colorama is installed, it will be enabled on
-#     Windows automatically. If the terminal lacks unicode/colors, we degrade.
-#   • Ring buffer of recent lines so the UI can mirror console output.
-#   • Friendly one-liners for parameters with short interpretations.
+# for the Web UI). Keeps legacy helpers (banner, gauge, progress, format_seconds)
+# and adds color log lines and parameter narration.
 #
 # Public API (stable):
 #   - banner(delta, beta, gamma) -> str
@@ -17,10 +11,10 @@
 #   - format_seconds(secs) -> str
 #   - info(msg), success(msg), warn(msg), error(msg), debug(msg)
 #   - section(title: str)
-#   - kv(label, value, *, color=None, unit=None)  -> prints "label: value unit"
-#   - param(name, value, *, meaning="", quality="neutral", unit=None, maxv=None, width=10)
+#   - kv(label, value, *, color=None, unit=None)
+#   - param(name, value, *, meaning="", quality="neutral", unit=None, maxv=None, width=10, advice=None)
 #   - recent(n=200) -> List[str]
-#   - recent_json(n=200) -> List[dict]   (timestamped records)
+#   - recent_json(n=200) -> List[dict]
 #   - clear_recent()
 #
 # MIT-style tiny utility. © 2025 ElementFold authors.
@@ -31,6 +25,7 @@ import math
 import os
 import sys
 import time
+import threading
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -51,13 +46,15 @@ def _supports_unicode() -> bool:
 
 def _supports_color() -> bool:
     """
-    Very conservative color support:
-      • honor NO_COLOR if present,
-      • require a TTY,
-      • otherwise disable color.
+    Conservative color support:
+      • honor NO_COLOR to disable,
+      • honor FORCE_COLOR=1 to force enable,
+      • otherwise require a TTY.
     """
-    if "NO_COLOR" in os.environ:
+    if os.environ.get("NO_COLOR"):
         return False
+    if os.environ.get("FORCE_COLOR", "") not in {"", "0"}:
+        return True
     try:
         return bool(sys.stdout.isatty())
     except Exception:
@@ -92,11 +89,9 @@ GLYPHS = {
 }
 
 class _C:
-    # ANSI codes (kept tiny; bold + faint + basic 8 colors)
     RESET = "\033[0m" if _COL else ""
     BOLD = "\033[1m" if _COL else ""
     FAINT = "\033[2m" if _COL else ""
-    DIM = FAINT
     # Colors
     RED = "\033[31m" if _COL else ""
     GREEN = "\033[32m" if _COL else ""
@@ -112,7 +107,6 @@ def _paint(txt: str, *styles: str) -> str:
     return "".join(styles) + txt + _C.RESET
 
 def _ts() -> str:
-    # Short timestamp (mm:ss)
     t = time.localtime()
     return f"{t.tm_min:02d}:{t.tm_sec:02d}"
 
@@ -121,26 +115,31 @@ def _ts() -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 _RECENT: deque[Dict[str, Any]] = deque(maxlen=600)
+_REC_LOCK = threading.Lock()
 
 def _push_recent(level: str, text: str) -> None:
-    _RECENT.append({
-        "t": time.time(),
-        "ts": _ts(),
-        "level": level,
-        "text": text,
-    })
+    with _REC_LOCK:
+        _RECENT.append({
+            "t": time.time(),
+            "ts": _ts(),
+            "level": level,
+            "text": text,
+        })
 
 def recent(n: int = 200) -> List[str]:
     """Most-recent lines as plain strings (for quick dumps)."""
-    items = list(_RECENT)[-int(max(1, n)):]
+    with _REC_LOCK:
+        items = list(_RECENT)[-int(max(1, n)):]
     return [f"[{r['ts']}] {r['level']}: {r['text']}" for r in items]
 
 def recent_json(n: int = 200) -> List[Dict[str, Any]]:
     """Most-recent lines as JSON records (for web UI)."""
-    return list(_RECENT)[-int(max(1, n)):]
+    with _REC_LOCK:
+        return list(_RECENT)[-int(max(1, n)):]
 
 def clear_recent() -> None:
-    _RECENT.clear()
+    with _REC_LOCK:
+        _RECENT.clear()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Legacy helpers (unchanged signatures)
@@ -154,7 +153,8 @@ def banner(delta: float, beta: float, gamma: float) -> str:
 def gauge(name: str, val: float, maxv: float, width: int = 10) -> str:
     m = max(1e-12, float(maxv))
     v = float(val)
-    if not math.isfinite(v): v = 0.0
+    if not math.isfinite(v):
+        v = 0.0
     v = min(max(v, 0.0), m)
     w = max(1, int(width))
     k = int(round(w * (v / m)))
@@ -199,25 +199,20 @@ def _emit(level: str, text: str, color: Optional[str] = None, icon: Optional[str
         icon = {"INFO": "ℹ", "OK": "✓", "WARN": "⚠", "ERR": "✖", "DBG": "·"}.get(level, "·") if _UNI else "*"
     left = f"[{_ts()}] {level}:"
     if color == "green":
-        left = _paint(left, _C.GREEN, _C.BOLD)
-        text = _paint(text, _C.GREEN)
+        left = _paint(left, _C.GREEN, _C.BOLD); text = _paint(text, _C.GREEN)
     elif color == "yellow":
-        left = _paint(left, _C.YELLOW, _C.BOLD)
-        text = _paint(text, _C.YELLOW)
+        left = _paint(left, _C.YELLOW, _C.BOLD); text = _paint(text, _C.YELLOW)
     elif color == "red":
-        left = _paint(left, _C.RED, _C.BOLD)
-        text = _paint(text, _C.RED)
+        left = _paint(left, _C.RED, _C.BOLD); text = _paint(text, _C.RED)
     elif color == "blue":
-        left = _paint(left, _C.CYAN, _C.BOLD)
-        text = _paint(text, _C.CYAN)
+        left = _paint(left, _C.CYAN, _C.BOLD); text = _paint(text, _C.CYAN)
     elif color == "magenta":
-        left = _paint(left, _C.MAGENTA, _C.BOLD)
-        text = _paint(text, _C.MAGENTA)
+        left = _paint(left, _C.MAGENTA, _C.BOLD); text = _paint(text, _C.MAGENTA)
     elif color == "gray":
-        left = _paint(left, _C.GRAY)
-        text = _paint(text, _C.GRAY)
+        left = _paint(left, _C.GRAY); text = _paint(text, _C.GRAY)
+
     line = f"{left} {icon} {text}"
-    print(line)
+    print(line, flush=True)
     _push_recent(level, text)
 
 def info(msg: str) -> None:
@@ -238,7 +233,7 @@ def debug(msg: str) -> None:
 def section(title: str) -> None:
     bar = "─" * max(6, min(60, len(title) + 10)) if _UNI else "-" * max(6, min(60, len(title) + 10))
     hdr = _paint(title, _C.BOLD)
-    print(f"\n{hdr}\n{_paint(bar, _C.GRAY)}")
+    print(f"\n{hdr}\n{_paint(bar, _C.GRAY)}", flush=True)
     _push_recent("SEC", title)
 
 def kv(label: str, value: Any, *, color: Optional[str] = None, unit: Optional[str] = None) -> None:
@@ -264,7 +259,7 @@ def param(
     value: float,
     *,
     meaning: str = "",
-    quality: str = "neutral",     # "good" | "warn" | "bad" | "neutral"
+    quality: str = "neutral",
     unit: Optional[str] = None,
     maxv: Optional[float] = None,
     width: int = 10,
@@ -277,22 +272,29 @@ def param(
     """
     # Left label + value
     try:
-        is_finite = math.isfinite(float(value))
+        v_float = float(value)
+        is_finite = math.isfinite(v_float)
     except Exception:
-        is_finite = False
-    val_txt = f"{float(value):.3f}" if is_finite else "n/a"
+        v_float, is_finite = 0.0, False
+
+    val_txt = f"{v_float:.3f}" if is_finite else "n/a"
     left = f"{name} {val_txt}"
     if unit:
         left += f" {unit}"
 
-    # Optional bar
+    # Optional bar (rendered directly; no slicing hacks)
     bar_txt = ""
-    if (maxv is not None) and is_finite:
-        bar_txt = "  " + gauge("", float(value), float(maxv), width=width)[1:]  # drop first char (label)
+    if (maxv is not None) and is_finite and maxv > 0:
+        m = float(maxv)
+        w = max(1, int(width))
+        v_clamped = min(max(v_float, 0.0), m)
+        k = int(round(w * (v_clamped / m)))
+        filled = GLYPHS["prog_fill"] * k
+        empty  = GLYPHS["prog_empty"] * (w - k)
+        bar_txt = f"  [{filled}{empty}]"
 
     # Meaning + advice
-    meaning = (meaning or "").strip()
-    hint = f" — {meaning}" if meaning else ""
+    hint = f" — {(meaning or '').strip()}" if meaning else ""
     if advice:
         hint += f"; next: {advice}"
 

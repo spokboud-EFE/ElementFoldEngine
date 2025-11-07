@@ -1,4 +1,4 @@
-# ElementFold · fgn.py
+# elementfold/fgn.py
 # ──────────────────────────────────────────────────────────────────────────────
 # Fold–Gate–Norm (FGN) is the engine’s heartbeat:
 #   1) Fold      — gather local structure along time without blowing up scale.
@@ -6,27 +6,25 @@
 #   3) Normalize — damp energy so depth remains stable.
 # Finally, a residual lane keeps identity always available.
 #
-# Key knobs (steered by Supervisor/RungController):
-#   • β (beta):     exposure — how strongly we amplify structure where g>0.
-#   • γ (gamma):    damping  — how hard we calm energy after gating.
-#   • ⛔ (clamp):   gate cap — soft bound on how negative g may go (safety).
+# Knobs (steered via Model.apply_control or external Supervisor):
+#   • β (beta):   exposure — how strongly we amplify structure where g>0.
+#   • γ (gamma):  damping  — how hard we calm energy after gating.
+#   • ⛔ clamp:   gate cap — soft bound on how negative g may go (safety).
 #
-# Design notes for coherence and safety
-# -------------------------------------
-# • Gate centering uses the *per‑sequence mean* so g has positive/negative mass.
-#   This lets β behave intuitively: β↑ → stronger amplification where g>0.
-# • We clamp g asymmetrically: g ∈ [−clamp, +g_pos_cap] with g_pos_cap≈1.
-#   The negative side follows ⛔; the positive side is lightly capped so
-#   e^{β·g} cannot explode (e^{2·1}≈7.4 at β≈2), while still allowing
-#   meaningful exposure boosts. Normalization then catches any excess.
-# • The residual projection is zero‑initialized so each block starts as *near‑identity*,
-#   making the first training steps gentle and predictable.
+# Design & safety:
+#   • Gate is centered per sequence (mean over T) so g has positive/negative mass.
+#   • Asymmetric clamp: g ∈ [−clamp, +pos_cap] with a light positive cap (~1.0)
+#     to allow meaningful boost yet avoid runaway exp(β·g). Norm then calms energy.
+#   • Residual projection is zero‑init so each block starts near‑identity.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+__all__ = ["FoldGrid", "Gate", "Norm", "FGNBlock"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -35,19 +33,19 @@ import torch.nn.functional as F
 class FoldGrid(nn.Module):
     """
     Depth‑wise 1D convolution over the time axis.
-    Each feature channel is folded independently (groups=d), so we never mix channels here.
-    This preserves identity and keeps the fold non‑expansive by default.
+    Each feature channel is folded independently (groups=d), so we never mix
+    channels here. This preserves identity and keeps the fold non‑expansive.
 
     Args:
         d:      number of channels (feature dimension D).
         kind:   'identity' (center tap = 1) or 'avg3' ([1,2,1]/4 smoothing).
-        learn:  if True, the kernel is learnable; if False, it stays as initialized.
+        learn:  if True, the kernel is learnable; otherwise it remains fixed.
     """
     def __init__(self, d: int, kind: str = "identity", learn: bool = True):
         super().__init__()
         self.conv = nn.Conv1d(d, d, kernel_size=3, padding=1, groups=d, bias=False)  # (B,D,T) ↔ (B,D,T)
         with torch.no_grad():
-            k = torch.zeros(d, 1, 3)
+            k = torch.zeros(d, 1, 3, dtype=self.conv.weight.dtype, device=self.conv.weight.device)
             if kind == "avg3":
                 k[:, :, 0] = 0.25; k[:, :, 1] = 0.50; k[:, :, 2] = 0.25
             else:  # 'identity'
@@ -69,21 +67,21 @@ class Gate(nn.Module):
 
     Centering & clamps
     ------------------
-    • We center g by subtracting the per‑sequence mean, so g has both signs.
-    • We cap g ∈ [−clamp, +g_pos_cap] with a *light* positive cap (≈1.0) to
-      enable amplification but avoid runaway gains. The negative side follows
-      ⛔ (clamp) exactly, matching the project’s “gate cap” semantics.
+    • g is centered by subtracting the per‑sequence mean over time (T).
+    • Asymmetric clamp: g ∈ [−clamp, +pos_cap] with a *light* positive cap (≈1.0)
+      to enable amplification but avoid runaway gains. The negative side follows
+      ⛔ (clamp) exactly.
 
     Args:
-        d:         feature dimension D (input to the small probe φ: ℝ^D→ℝ).
+        d:         feature dimension D (input to the probe φ: ℝ^D→ℝ).
         pos_cap:   positive cap for g (safe exposure ceiling, default 1.0).
     """
     def __init__(self, d: int, pos_cap: float = 1.0):
         super().__init__()
         self.lin = nn.Linear(d, 1)                              # φ(x): (B,T,D) → (B,T,1)
-        self.beta  = nn.Parameter(torch.tensor(1.0))            # β exposure (learnable; can be steered)
+        self.beta  = nn.Parameter(torch.tensor(1.0))            # β exposure (learnable; steerable)
         self.clamp = nn.Parameter(torch.tensor(5.0))            # ⛔ negative cap magnitude
-        self._g_pos_cap = float(pos_cap)                        # light positive cap (constant by default)
+        self._g_pos_cap = float(pos_cap)                        # light positive cap (constant)
 
         # Gentle init: keep φ small so exp(β·g) ≈ 1 at start.
         nn.init.normal_(self.lin.weight, std=0.02)
@@ -93,23 +91,30 @@ class Gate(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B,T,D)
-        returns: (B,T,1) multiplicative gain
+        returns: (B,T,1) multiplicative gain (same device as x)
         """
         # Raw gate potential and per‑sequence mean centering
         g = self.lin(x).squeeze(-1)                             # (B,T)
-        g = g - g.mean(dim=1, keepdim=True)                     # center per sequence (row)
+        g = g - g.mean(dim=1, keepdim=True)                     # center per sequence
 
         # Asymmetric safety clamp: negative side follows ⛔, positive side lightly capped
         neg_cap = -self.clamp.item()
         pos_cap =  self._g_pos_cap
         g = g.clamp(min=neg_cap, max=pos_cap)                   # (B,T)
 
-        # Exponential gain; broadcast over channels
-        gain = torch.exp(self.beta * g).unsqueeze(-1)           # (B,T,1)
+        # Mixed‑precision‑safe exponential:
+        # - clamp β·g to a numerically safe window
+        # - compute exp in fp32 when running in low precision, then cast back
+        EXP_CAP = 12.0  # e^{±12} ~ [6e-6, 1.6e5]
+        prod = (self.beta.to(g.dtype) * g).clamp(-EXP_CAP, EXP_CAP)
+        if prod.dtype in (torch.float16, torch.bfloat16):
+            gain = torch.exp(prod.float()).to(dtype=prod.dtype).unsqueeze(-1)  # (B,T,1)
+        else:
+            gain = torch.exp(prod).unsqueeze(-1)                                # (B,T,1)
         return gain
 
-    def set_control(self, beta: float | None = None, clamp: float | None = None) -> None:
-        """External control hook (Supervisor/RungController)."""
+    def set_control(self, *, beta: Optional[float] = None, clamp: Optional[float] = None) -> None:
+        """External slow‑control hook."""
         with torch.no_grad():
             if beta is not None:
                 self.beta.copy_(torch.tensor(float(beta), device=self.beta.device, dtype=self.beta.dtype))
@@ -136,12 +141,13 @@ class Norm(nn.Module):
         self.eps   = 1e-6
 
     def forward(self, y: torch.Tensor) -> torch.Tensor:
-        g = torch.clamp(self.gamma, 0.0, 1.0)
+        # Clamp gamma and match dtype for mixed‑precision stability
+        g = torch.clamp(self.gamma, 0.0, 1.0).to(dtype=y.dtype)
         scale = (y.abs().sum(dim=-1, keepdim=True) + self.eps).pow(g)
         return y / scale
 
-    def set_control(self, gamma: float | None = None) -> None:
-        """External control hook (Supervisor/RungController)."""
+    def set_control(self, *, gamma: Optional[float] = None) -> None:
+        """External slow‑control hook."""
         if gamma is not None:
             with torch.no_grad():
                 self.gamma.copy_(torch.tensor(float(gamma), device=self.gamma.device, dtype=self.gamma.dtype))
@@ -166,8 +172,14 @@ class FGNBlock(nn.Module):
         resid_scale:  scale on the residual update before adding back.
         dropout:      optional dropout after projection (regularization).
     """
-    def __init__(self, d: int, fold_kind: str = "identity", fold_learn: bool = True,
-                 resid_scale: float = 1.0, dropout: float = 0.0):
+    def __init__(
+        self,
+        d: int,
+        fold_kind: str = "identity",
+        fold_learn: bool = True,
+        resid_scale: float = 1.0,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.fold = FoldGrid(d, kind=fold_kind, learn=fold_learn)          # (B,T,D) → (B,T,D)
         self.gate = Gate(d)                                                # (B,T,D) → (B,T,1) gain
@@ -186,16 +198,22 @@ class FGNBlock(nn.Module):
         x: (B,T,D) → out: (B,T,D)
         """
         y = self.fold(x)                      # 1) structural fold (depth‑wise)
-        gain = self.gate(x)                   # 2) exposure from current state
+        gain = self.gate(x).to(dtype=x.dtype) # 2) exposure from current state
         y = y * gain
         y = self.norm(y)                      # 3) damping
         y = self.drop(self.proj(y))           # project (and maybe drop)
         return x + self.resid_scale * y       # 4) residual add
 
-    # External slow‑control: (β, γ, ⛔)
-    def apply_control(self, beta: float | None = None, gamma: float | None = None, clamp: float | None = None) -> None:
+    def apply_control(
+        self,
+        *,
+        beta: Optional[float] = None,
+        gamma: Optional[float] = None,
+        clamp: Optional[float] = None,
+    ) -> None:
         """
-        Update inner gate/norm hyper‑parameters from an external controller.
+        External slow‑control: update inner gate/norm hyper‑parameters.
+        Mirrors Model.apply_control(...) expectations.
         """
         self.gate.set_control(beta=beta, clamp=clamp)
         self.norm.set_control(gamma=gamma)
