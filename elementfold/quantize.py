@@ -1,55 +1,63 @@
 # ElementFold · quantize.py
-# INT8 helpers that keep the Fold–Gate–Norm engine coherent on low‑precision hardware.
-# Read this like a toolbox:
-#   1) Per‑tensor / per‑channel symmetric quantization (int8 in [−127, +127], zero‑point 0).
-#   2) EMA observers to calibrate scales from activations without storing full histograms.
-#   3) Fake‑quantize (quantize → dequantize) for dry runs and training‑time simulation.
-#      • Includes an STE (straight‑through estimator) variant for QAT.
-#   4) Weight‑only quantized modules: QLinear and QConv1d (drop‑in for nn.Linear / nn.Conv1d).
-#   5) Whole‑model converters that swap modules in place for inference — and a reverse path
-#      back to float modules if you want to unquantize later.
-#   6) Tiny utilities: count params, quick error report, activation stubs.
+# ============================================================
+# Quantization helpers for the Fold–Gate–Norm engine.
 #
-# Design choices (plain words):
-#   • Symmetric INT8 with z=0 keeps algebra tidy and predictable (no bias drift from z≠0).
-#   • We avoid −128 so +/− ranges are perfectly symmetric (−127…+127) — rounding behaves nicely.
-#   • Weight‑only quant preserves numerics in Gate/Norm while giving a solid memory win.
-#   • Dequantize‑at‑use is portable and dependency‑free; if you later target int8 GEMM backends,
-#     the layout (W_q + per‑out scale) maps naturally.
+# Purpose:
+#   Quantization allows ElementFold to run coherently on
+#   low-precision (INT8) hardware without breaking phase laws.
+#
+# Overview of contents:
+#   1. Core constants and safe guards.
+#   2. Scale selection and tensor (de)quantization primitives.
+#   3. Observers and fake-quantization for training simulation.
+#   4. Weight-only quantized layers: QLinear, QConv1d.
+#   5. Model-level converters (quantize ↔ float).
+#   6. Diagnostics and small ergonomic helpers.
+#
+# Plain words:
+#   We pack numbers into INT8 [−127, +127] using symmetric scales.
+#   This keeps the algebra centered (zero → zero) and predictable.
+#   The “EMA observers” act like slow relaxation meters: they
+#   estimate the needed scale s = max|x| / 127 over time.
+#   Weight-only quantization saves memory and stays portable.
+# ============================================================
 
 from __future__ import annotations
-
-from typing import Tuple, Dict, Any, Iterable, Optional
+from typing import Tuple, Dict, Any, Optional, Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ============================================================
+# 0. Core constants and tiny guards
+# ============================================================
+# Symmetric range avoids −128 asymmetry and keeps rounding unbiased.
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 0) Core constants and tiny guards
-# ───────────────────────────────────────────────────────────────────────────────
-
-# We use a symmetric int8 range on purpose. Keeping −127…+127 avoids the “extra −128”
-# asymmetry that can skew round‑trip error statistics.
 INT8_QMIN_SYM = -127
 INT8_QMAX_SYM = +127
-EPS = 1e-12  # tiny epsilon to avoid divide‑by‑zero in scale selection
+EPS = 1e-12  # small epsilon to avoid division by zero
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 1) Scale selection and (de)quantization primitives
-# ───────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# 1. Scale selection and tensor (de)quantization
+# ============================================================
 
-def _choose_scale_symmetric(x: torch.Tensor, per_channel: bool = False, ch_axis: int = 0) -> torch.Tensor:
+def _choose_scale_symmetric(x: torch.Tensor,
+                            per_channel: bool = False,
+                            ch_axis: int = 0) -> torch.Tensor:
     """
-    Pick a symmetric scale `s` so that `x/s` fits into [−127, +127].
-    If per_channel=True, compute one scale per channel along `ch_axis`.
-    Returns a scalar tensor (per‑tensor) or a length‑C tensor (per‑channel).
+    Compute a symmetric scaling factor `s` so that x/s ∈ [−127, +127].
+
+    If per_channel=True, we compute one scale per output channel
+    along `ch_axis` — used for weights where each row or filter
+    can have its own dynamic range.
+
+    Returns:
+        s : scalar tensor (per-tensor) or vector (per-channel)
     """
     with torch.no_grad():
         if per_channel:
             dims = [i for i in range(x.dim()) if i != ch_axis]
-            # max|x| per channel (float32 for safe divisions)
             maxabs = x.detach().abs().amax(dim=dims, keepdim=False).to(torch.float32)
         else:
             maxabs = x.detach().abs().max().to(torch.float32)
@@ -57,28 +65,28 @@ def _choose_scale_symmetric(x: torch.Tensor, per_channel: bool = False, ch_axis:
         return s
 
 
-def quantize_tensor(
-    x: torch.Tensor,
-    scale: torch.Tensor | None = None,
-    zero_point: int | torch.Tensor = 0,
-    per_channel: bool = False,
-    ch_axis: int = 0,
-    qmin: int = INT8_QMIN_SYM,
-    qmax: int = INT8_QMAX_SYM,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def quantize_tensor(x: torch.Tensor,
+                    scale: torch.Tensor | None = None,
+                    zero_point: int | torch.Tensor = 0,
+                    per_channel: bool = False,
+                    ch_axis: int = 0,
+                    qmin: int = INT8_QMIN_SYM,
+                    qmax: int = INT8_QMAX_SYM
+                    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Quantize a float tensor `x` to int8 with symmetric scaling.
+    Quantize float tensor x → int8 using symmetric scaling.
 
-    Returns:
-        q  — int8 tensor with values in [qmin, qmax]
-        s  — scale tensor (scalar or per‑channel)
-        z  — zero‑point tensor (always 0 for symmetric)
+    Returns
+    -------
+    q : int8 tensor (values in [−127,+127])
+    s : scale tensor (per-tensor or per-channel)
+    z : zero point (always 0 here)
     """
     s = _choose_scale_symmetric(x, per_channel, ch_axis) if scale is None else scale.to(torch.float32)
     z = torch.as_tensor(zero_point, dtype=torch.float32, device=x.device)
     if per_channel:
         shape = [1] * x.dim()
-        shape[ch_axis] = -1  # broadcast scale over channel axis
+        shape[ch_axis] = -1
         s_view = s.view(shape)
     else:
         s_view = s
@@ -86,33 +94,48 @@ def quantize_tensor(
     return q, s, z.to(x.device)
 
 
-def dequantize_tensor(q: torch.Tensor, scale: torch.Tensor, zero_point: int | torch.Tensor = 0) -> torch.Tensor:
+def dequantize_tensor(q: torch.Tensor,
+                      scale: torch.Tensor,
+                      zero_point: int | torch.Tensor = 0) -> torch.Tensor:
     """
-    Convert int8 tensor back to float using the stored scale (and z=0).
+    Convert INT8 tensor back to float using scale and zero-point.
+    Plain words: multiply by the scale — the inverse of quantization.
     """
     z = torch.as_tensor(zero_point, dtype=torch.float32, device=q.device)
     return (q.to(torch.float32) - z) * scale.to(torch.float32)
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 2) Observers and fake quantization (training‑time simulation)
-# ───────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# 2. Observers and fake quantization (training simulation)
+# ============================================================
 
 class EMAMaxAbsObserver(nn.Module):
     """
-    Track an exponential‑moving average of max|x| to calibrate symmetric scales.
-    Useful for dynamic activations (per‑tensor or per‑channel).
+    Track an exponential-moving average of max|x| to estimate scale.
+
+    Used to calibrate dynamic ranges during training without
+    storing full activation histograms.
+
+    Parameters
+    ----------
+    momentum : float
+        How fast the running value adapts (0.95 → slow, stable).
+    per_channel : bool
+        Whether to track per-channel or global magnitude.
+    ch_axis : int
+        Channel axis for per-channel mode.
     """
-    def __init__(self, momentum: float = 0.95, per_channel: bool = False, ch_axis: int = 0):
+    def __init__(self, momentum: float = 0.95,
+                 per_channel: bool = False, ch_axis: int = 0):
         super().__init__()
         self.momentum = float(momentum)
         self.per_channel = bool(per_channel)
         self.ch_axis = int(ch_axis)
-        # PyTorch allows registering None; we use it as a sentinel until first update.
         self.register_buffer("running", None, persistent=False)
 
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
+        """Update the running EMA of |x|."""
         if self.per_channel:
             dims = [i for i in range(x.dim()) if i != self.ch_axis]
             maxabs = x.detach().abs().amax(dim=dims, keepdim=False).to(torch.float32)
@@ -125,7 +148,10 @@ class EMAMaxAbsObserver(nn.Module):
 
     @torch.no_grad()
     def get_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # scale s = EMA(max|x|) / 127; zero‑point z=0 in the symmetric scheme
+        """
+        Return current (scale, zero-point).
+        s = EMA(max|x|)/127, z=0 in symmetric scheme.
+        """
         if self.running is None:
             s = torch.tensor(1.0)
         else:
@@ -134,19 +160,18 @@ class EMAMaxAbsObserver(nn.Module):
         return s, z
 
 
-def fake_quantize(
-    x: torch.Tensor,
-    observer: Optional[EMAMaxAbsObserver] = None,
-    per_channel: bool = False,
-    ch_axis: int = -1,
-) -> torch.Tensor:
+def fake_quantize(x: torch.Tensor,
+                  observer: Optional[EMAMaxAbsObserver] = None,
+                  per_channel: bool = False,
+                  ch_axis: int = -1) -> torch.Tensor:
     """
-    Simulate quantization (quantize → dequantize) while keeping float tensors.
-    This is handy during training/eval to preview quantization effects.
-    Uses a “stop‑gradient” path (rounding is not differentiable).
+    Simulate quantization (quantize → dequantize) but keep float tensors.
+    This preview lets you see quantization effects during training.
 
-    If an observer is provided, we update it and use its EMA scale; otherwise we
-    compute a fresh scale from the current batch.
+    If observer provided:
+        update its running scale and use that value.
+    Else:
+        compute a fresh scale from this batch.
     """
     if observer is not None:
         observer.update(x)
@@ -162,72 +187,76 @@ def fake_quantize(
             shape[ch_axis] = -1
             s = s.view(shape)
     q = torch.round(x / s).clamp(INT8_QMIN_SYM, INT8_QMAX_SYM).to(torch.int8)
-    return q.to(torch.float32) * s  # dequantized float (fake‑quant)
+    return q.to(torch.float32) * s
 
 
-def fake_quantize_ste(
-    x: torch.Tensor,
-    observer: Optional[EMAMaxAbsObserver] = None,
-    per_channel: bool = False,
-    ch_axis: int = -1,
-) -> torch.Tensor:
+def fake_quantize_ste(x: torch.Tensor,
+                      observer: Optional[EMAMaxAbsObserver] = None,
+                      per_channel: bool = False,
+                      ch_axis: int = -1) -> torch.Tensor:
     """
-    Straight‑Through Estimator (STE) fake‑quantization.
-    Forward: quantize→dequantize like fake_quantize().
-    Backward: gradient passes as if the op were identity (a standard QAT trick).
-
-    Implementation detail:
-      y = x_q_dequant - x  (no‑grad)  + x  (grad flows)
+    Straight-Through Estimator (STE) version of fake-quantization.
+    Forward: behaves like fake_quantize().
+    Backward: gradient passes as identity (dL/dx ≈ dL/dy).
     """
     with torch.no_grad():
-        y_nograd = fake_quantize(x, observer=observer, per_channel=per_channel, ch_axis=ch_axis)
+        y_nograd = fake_quantize(x, observer=observer,
+                                 per_channel=per_channel, ch_axis=ch_axis)
+    # (y_nograd - x).detach() cuts gradient; +x restores it.
     return (y_nograd - x).detach() + x
 
 
 class QuantStub(nn.Module):
     """
-    Tiny activation quantizer you can insert at module boundaries:
-        x → fake‑quant (observer‑driven scale)
+    Small module you can insert before layers to simulate activation quantization.
+    It owns an EMA observer that learns the scale automatically.
     """
-    def __init__(self, per_channel: bool = False, ch_axis: int = -1, ste: bool = False, momentum: float = 0.95):
+    def __init__(self, per_channel: bool = False, ch_axis: int = -1,
+                 ste: bool = False, momentum: float = 0.95):
         super().__init__()
-        self.observer = EMAMaxAbsObserver(momentum=momentum, per_channel=per_channel, ch_axis=ch_axis)
+        self.observer = EMAMaxAbsObserver(momentum=momentum,
+                                          per_channel=per_channel, ch_axis=ch_axis)
         self.per_channel = per_channel
         self.ch_axis = ch_axis
         self.ste = bool(ste)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.ste and self.training:
-            return fake_quantize_ste(x, observer=self.observer, per_channel=self.per_channel, ch_axis=self.ch_axis)
-        return fake_quantize(x, observer=self.observer, per_channel=self.per_channel, ch_axis=self.ch_axis)
+            return fake_quantize_ste(x, observer=self.observer,
+                                     per_channel=self.per_channel, ch_axis=self.ch_axis)
+        return fake_quantize(x, observer=self.observer,
+                             per_channel=self.per_channel, ch_axis=self.ch_axis)
 
 
 class DeQuantStub(nn.Module):
-    """
-    No‑op placeholder for symmetry with frameworks that separate Quant/DeQuant.
-    Kept for API familiarity; here it simply returns x.
-    """
+    """Identity layer for compatibility with frameworks that separate Quant/DeQuant."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 3) Weight‑only quantized layers (drop‑in for nn.Linear / nn.Conv1d)
-# ───────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# 3. Weight-only quantized layers
+# ============================================================
 
 class QLinear(nn.Module):
     """
-    Weight‑only int8 linear layer.
-    We store W_q ∈ int8 and scale per OUT channel; on forward we dequantize to float and run F.linear.
-    (Real backends can run int8×int8 GEMM; we keep this portable and dependency‑free.)
+    Weight-only int8 Linear layer (drop-in for nn.Linear).
+
+    We store:
+        weight_q : int8 weights
+        scale_w  : per-output scale (float)
+        bias     : float bias
+
+    On forward we dequantize W = weight_q * scale_w[:,None]
+    and use F.linear(x, W, bias).
     """
-    def __init__(self, weight_q: torch.Tensor, scale_w: torch.Tensor, bias: torch.Tensor | None,
-                 in_features: int, out_features: int):
+    def __init__(self, weight_q: torch.Tensor, scale_w: torch.Tensor,
+                 bias: torch.Tensor | None, in_features: int, out_features: int):
         super().__init__()
-        self.register_buffer("weight_q", weight_q.to(torch.int8), persistent=True)   # (O, I) int8
-        self.register_buffer("scale_w", scale_w.to(torch.float32), persistent=True)  # (O,) float
+        self.register_buffer("weight_q", weight_q.to(torch.int8), persistent=True)
+        self.register_buffer("scale_w", scale_w.to(torch.float32), persistent=True)
         if bias is not None:
-            self.register_buffer("bias", bias.to(torch.float32), persistent=True)    # (O,) float
+            self.register_buffer("bias", bias.to(torch.float32), persistent=True)
         else:
             self.bias = None
         self.in_features = int(in_features)
@@ -235,29 +264,31 @@ class QLinear(nn.Module):
 
     @classmethod
     def from_float(cls, m: nn.Linear) -> "QLinear":
-        W = m.weight.detach()                                                        # (O, I)
-        s = _choose_scale_symmetric(W, per_channel=True, ch_axis=0)                  # (O,)
+        """Quantize a float nn.Linear into QLinear."""
+        W = m.weight.detach()
+        s = _choose_scale_symmetric(W, per_channel=True, ch_axis=0)
         q = torch.round(W / s.unsqueeze(1)).clamp(INT8_QMIN_SYM, INT8_QMAX_SYM).to(torch.int8)
         b = None if m.bias is None else m.bias.detach()
         return cls(q, s, b, W.size(1), W.size(0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        W = self.weight_q.to(torch.float32) * self.scale_w.unsqueeze(1)              # dequantize rows
+        W = self.weight_q.to(torch.float32) * self.scale_w.unsqueeze(1)
         return F.linear(x, W, self.bias)
 
 
 class QConv1d(nn.Module):
     """
-    Weight‑only int8 Conv1d.
-    We store W_q ∈ int8 and a per‑OUT‑channel scale; on forward we dequantize to float and run F.conv1d.
-    Supports depthwise/grouped convolution via stored hyperparameters.
+    Weight-only int8 Conv1d.
+    Stores int8 weights + per-out-channel scale.
+    On forward, dequantizes to float and calls F.conv1d.
     """
-    def __init__(self, weight_q: torch.Tensor, scale_w: torch.Tensor, bias: torch.Tensor | None,
-                 stride: int | Tuple[int] = 1, padding: int | Tuple[int] = 0, dilation: int | Tuple[int] = 1,
+    def __init__(self, weight_q: torch.Tensor, scale_w: torch.Tensor,
+                 bias: torch.Tensor | None, stride: int | Tuple[int] = 1,
+                 padding: int | Tuple[int] = 0, dilation: int | Tuple[int] = 1,
                  groups: int = 1):
         super().__init__()
-        self.register_buffer("weight_q", weight_q.to(torch.int8), persistent=True)   # (O, I/G, K)
-        self.register_buffer("scale_w", scale_w.to(torch.float32), persistent=True)  # (O,)
+        self.register_buffer("weight_q", weight_q.to(torch.int8), persistent=True)
+        self.register_buffer("scale_w", scale_w.to(torch.float32), persistent=True)
         if bias is not None:
             self.register_buffer("bias", bias.to(torch.float32), persistent=True)
         else:
@@ -269,27 +300,25 @@ class QConv1d(nn.Module):
 
     @classmethod
     def from_float(cls, m: nn.Conv1d) -> "QConv1d":
-        W = m.weight.detach()                                                        # (O, I/G, K)
-        s = _choose_scale_symmetric(W, per_channel=True, ch_axis=0)                  # (O,)
+        W = m.weight.detach()
+        s = _choose_scale_symmetric(W, per_channel=True, ch_axis=0)
         q = torch.round(W / s.view(-1, 1, 1)).clamp(INT8_QMIN_SYM, INT8_QMAX_SYM).to(torch.int8)
         b = None if m.bias is None else m.bias.detach()
         return cls(q, s, b, m.stride, m.padding, m.dilation, m.groups)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        W = self.weight_q.to(torch.float32) * self.scale_w.view(-1, 1, 1)            # dequantize per OUT
-        return F.conv1d(x, W, self.bias, stride=self.stride, padding=self.padding,
+        W = self.weight_q.to(torch.float32) * self.scale_w.view(-1, 1, 1)
+        return F.conv1d(x, W, self.bias,
+                        stride=self.stride, padding=self.padding,
                         dilation=self.dilation, groups=self.groups)
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 4) Model‑level converters (both directions)
-# ───────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# 4. Model-level converters
+# ============================================================
 
 def quantize_module(m: nn.Module) -> nn.Module:
-    """
-    Convert a float nn.Module to its weight‑only int8 counterpart when supported.
-    Unknown modules are returned unchanged.
-    """
+    """Replace a float module with its quantized version if supported."""
     if isinstance(m, nn.Linear):
         return QLinear.from_float(m)
     if isinstance(m, nn.Conv1d):
@@ -298,15 +327,12 @@ def quantize_module(m: nn.Module) -> nn.Module:
 
 
 def to_float_module(m: nn.Module) -> nn.Module:
-    """
-    Inverse of quantize_module(): rebuild a float nn.Module from QLinear/QConv1d.
-    This is handy when you want to unquantize a model for further fine‑tuning.
-    """
+    """Inverse: convert quantized QLinear/QConv1d back to float modules."""
     if isinstance(m, QLinear):
         device = m.weight_q.device
         dtype = torch.float32
-        out_features, in_features = int(m.out_features), int(m.in_features)
-        mm = nn.Linear(in_features, out_features, bias=(m.bias is not None)).to(device)
+        mm = nn.Linear(m.in_features, m.out_features,
+                       bias=(m.bias is not None)).to(device)
         with torch.no_grad():
             W = m.weight_q.to(dtype) * m.scale_w.unsqueeze(1)
             mm.weight.copy_(W)
@@ -317,13 +343,9 @@ def to_float_module(m: nn.Module) -> nn.Module:
     if isinstance(m, QConv1d):
         device = m.weight_q.device
         dtype = torch.float32
-        O = m.weight_q.size(0)
-        I_over_G = m.weight_q.size(1)
-        K = m.weight_q.size(2)
+        O, I_over_G, K = m.weight_q.size()
         G = int(m.groups)
-        in_channels = int(I_over_G * G)
-        out_channels = int(O)
-        mm = nn.Conv1d(in_channels, out_channels, kernel_size=K,
+        mm = nn.Conv1d(in_channels=I_over_G * G, out_channels=O, kernel_size=K,
                        stride=m.stride, padding=m.padding, dilation=m.dilation,
                        groups=G, bias=(m.bias is not None)).to(device)
         with torch.no_grad():
@@ -333,40 +355,35 @@ def to_float_module(m: nn.Module) -> nn.Module:
                 mm.bias.copy_(m.bias.to(dtype))
         return mm
 
-    return m  # unchanged
+    return m
 
 
 def quantize_model_weights(model: nn.Module) -> nn.Module:
-    """
-    Walk the module tree and replace supported layers with weight‑only int8 versions.
-    Safe for inference: shapes/outputs remain compatible (modulo tiny quantization error).
-    """
+    """Recursively replace supported submodules with weight-only int8 versions."""
     for name, child in list(model.named_children()):
         qchild = quantize_module(child)
         setattr(model, name, qchild)
-        quantize_model_weights(qchild)  # recurse
+        quantize_model_weights(qchild)
     return model
 
 
 def dequantize_model_weights(model: nn.Module) -> nn.Module:
-    """
-    Reverse of quantize_model_weights(): swap QLinear/QConv1d layers back to float modules.
-    """
+    """Recursively convert quantized modules back to float versions."""
     for name, child in list(model.named_children()):
         fchild = to_float_module(child)
         setattr(model, name, fchild)
-        dequantize_model_weights(fchild)  # recurse
+        dequantize_model_weights(fchild)
     return model
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 5) Small diagnostics & ergonomics
-# ───────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# 5. Diagnostics & ergonomics
+# ============================================================
 
 def count_int8_params(model: nn.Module) -> Tuple[int, int]:
     """
-    Count total parameters and how many are stored in int8 buffers (weight_q).
-    Returns: (int8_params, total_params)
+    Count how many parameters/buffers are stored as int8.
+    Returns (int8_params, total_params).
     """
     total = 0
     int8_params = 0
@@ -374,25 +391,24 @@ def count_int8_params(model: nn.Module) -> Tuple[int, int]:
         total += p.numel()
     for b in model.buffers(recurse=True):
         total += b.numel()
-        if b.dtype == torch.int8 and b.requires_grad is False:
+        if b.dtype == torch.int8 and not b.requires_grad:
             int8_params += b.numel()
     return int(int8_params), int(total)
 
 
 def weight_error_report(m: nn.Module) -> Dict[str, float]:
     """
-    For a quantized layer, report a simple weight‑only reconstruction error:
-      max_abs_diff, mean_abs_diff
-    (Convenient for quick sanity checks.)
+    Quick reconstruction error report for quantized weights.
+    (Compares dequantized weights to their stored quantized form.)
     """
     if isinstance(m, QLinear):
-        Wq = (m.weight_q.to(torch.float32) * m.scale_w.unsqueeze(1))
+        Wq = m.weight_q.to(torch.float32) * m.scale_w.unsqueeze(1)
         return {
-            "max_abs_diff": float((Wq - Wq.detach()).abs().max().item()),   # trivial 0 here; placeholder for pattern
+            "max_abs_diff": float((Wq - Wq.detach()).abs().max().item()),
             "mean_abs_diff": float((Wq - Wq.detach()).abs().mean().item())
         }
     if isinstance(m, QConv1d):
-        Wq = (m.weight_q.to(torch.float32) * m.scale_w.view(-1, 1, 1))
+        Wq = m.weight_q.to(torch.float32) * m.scale_w.view(-1, 1, 1)
         return {
             "max_abs_diff": float((Wq - Wq.detach()).abs().max().item()),
             "mean_abs_diff": float((Wq - Wq.detach()).abs().mean().item())
@@ -400,37 +416,25 @@ def weight_error_report(m: nn.Module) -> Dict[str, float]:
     return {}
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 6) Public API (friendly aliases)
-# ───────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# 6. Friendly aliases and exports
+# ============================================================
 
-def quantize_tensor_symmetric(x: torch.Tensor, per_channel: bool = False, ch_axis: int = 0):
-    """Alias for symmetric int8 quantization with zero‑point 0."""
+def quantize_tensor_symmetric(x: torch.Tensor,
+                              per_channel: bool = False,
+                              ch_axis: int = 0):
+    """Shortcut for symmetric int8 quantization with z=0."""
     return quantize_tensor(x, per_channel=per_channel, ch_axis=ch_axis,
                            qmin=INT8_QMIN_SYM, qmax=INT8_QMAX_SYM)
 
 
 __all__ = [
-    # Observers & fake‑quant
-    "EMAMaxAbsObserver",
-    "fake_quantize",
-    "fake_quantize_ste",
-    "QuantStub",
-    "DeQuantStub",
-    # Tensor quant primitives
-    "quantize_tensor",
-    "dequantize_tensor",
-    "quantize_tensor_symmetric",
-    # Modules & converters
-    "QLinear",
-    "QConv1d",
-    "quantize_module",
-    "to_float_module",
-    "quantize_model_weights",
-    "dequantize_model_weights",
-    # Diagnostics & constants
-    "count_int8_params",
-    "weight_error_report",
-    "INT8_QMIN_SYM",
-    "INT8_QMAX_SYM",
+    "EMAMaxAbsObserver", "fake_quantize", "fake_quantize_ste",
+    "QuantStub", "DeQuantStub",
+    "quantize_tensor", "dequantize_tensor", "quantize_tensor_symmetric",
+    "QLinear", "QConv1d",
+    "quantize_module", "to_float_module",
+    "quantize_model_weights", "dequantize_model_weights",
+    "count_int8_params", "weight_error_report",
+    "INT8_QMIN_SYM", "INT8_QMAX_SYM",
 ]
