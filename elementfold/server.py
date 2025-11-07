@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse, json, traceback
 from http.server import BaseHTTPRequestHandler
 from .server_brain import BrainHandlerMixin
+from .server_brain_loop import BrainLoopHandlerMixin
+from elementfold.core import data
 try:
     from http.server import ThreadingHTTPServer as HTTPServer
 except Exception:
@@ -55,7 +57,7 @@ def _model() -> RelaxationModel:
 # HTTP handler
 # ============================================================
 
-class Handler(BaseHTTPRequestHandler, BrainHandlerMixin):
+class Handler(BaseHTTPRequestHandler, BrainHandlerMixin, BrainLoopHandlerMixin):
 
     def _set_headers(self, status: int = 200, content_type: str = "application/json") -> None:
         self.send_response(status)
@@ -139,6 +141,11 @@ class Handler(BaseHTTPRequestHandler, BrainHandlerMixin):
             
             if path == "/brain/step":
                 return self._handle_brain_step(data)
+        
+            if path == "/brain/loop/start":
+                return self._handle_brain_loop_start(data)
+            if path == "/brain/loop/stop":
+                return self._handle_brain_loop_stop(data)
 
             return self._send_error(404, "not_found", f"unknown POST path: {path}")
 
