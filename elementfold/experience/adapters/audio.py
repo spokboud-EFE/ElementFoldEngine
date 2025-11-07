@@ -28,8 +28,8 @@ import wave             # stdlib WAV writer
 import torch
 
 from .base import AdapterRegistry                         # 🗂 adapter registry
-from elementfold.tokenizer import SimpleTokenizer         # ✴ tiny byte tokenizer
-from elementfold.infer import infer_loop                  # ✴ unified decoding path across adapters
+from elementfold.core.tokenizer import SimpleTokenizer         # ✴ tiny byte tokenizer
+from elementfold.core.infer import infer_loop                  # ✴ unified decoding path across adapters
 
 # Optional steering support: map raw ℝ⁸ → {'beta','gamma','clamp','style'}; optional caption via describe()
 try:

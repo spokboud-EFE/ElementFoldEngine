@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from .base import AdapterRegistry                     # 🗂 adapter registry
-from elementfold.tokenizer import SimpleTokenizer     # ✴ tiny byte tokenizer
+from elementfold.core.tokenizer import SimpleTokenizer     # ✴ tiny byte tokenizer
 
 # Optional import: used to map raw ℝ⁸ into (beta, gamma, clamp) and summarize.
 try:

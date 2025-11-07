@@ -27,10 +27,10 @@ from torch.nn.utils import clip_grad_norm_
 # Project imports with safe fallbacks (keep the loop runnable in minimal setups)
 # ──────────────────────────────────────────────────────────────────────────────
 
-from .core.model import Model
-from .core.variational import VariationalLedger
-from .core.telemetry import measure
-from .core.control import Supervisor
+from .model import Model
+from .variational import VariationalLedger
+from .telemetry import measure
+from .control import Supervisor
 
 # --- Align head (optional) ----------------------------------------------------
 try:

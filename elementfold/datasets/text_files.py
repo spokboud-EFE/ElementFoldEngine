@@ -13,7 +13,7 @@ import os, io, random                                  # ✴ file I/O and a dab 
 from typing import Iterable, Iterator, List, Optional   # ✴ readable type hints
 import torch                                            # ✴ tensors + DataLoader
 from torch.utils.data import IterableDataset, DataLoader
-from ..tokenizer import SimpleTokenizer                 # ✴ tiny byte tokenizer (vocab≈256)
+from ..core.tokenizer import SimpleTokenizer                 # ✴ tiny byte tokenizer (vocab≈256)
 
 
 # ———————————————————————————————————————————————————————————

@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 
 # κ(x,y) = cos(2π(x−y)/δ★); defined in core/ledger.py
-from .core.ledger import char_kernel
+from .ledger import char_kernel
 
 
 __all__ = ["AlignHead"]

@@ -39,8 +39,8 @@ from typing import Any, Dict, Tuple, Optional
 
 import torch
 from .base import AdapterRegistry
-from ...tokenizer import SimpleTokenizer
-from ...infer import infer_loop                # ⟲ unified decoding
+from ...core.tokenizer import SimpleTokenizer
+from ...core.infer import infer_loop                # ⟲ unified decoding
 
 # Reuse the language adapter runner for text parts (keeps behavior identical).
 # We prefer late lookup via AdapterRegistry to avoid import order traps,

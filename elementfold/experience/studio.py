@@ -33,7 +33,7 @@ from typing import Tuple, Any, Dict, Optional, List, Callable
 import torch
 
 from ..utils.bootstrap import bootstrap_brain_env
-from ..config import Config
+from ..utils.config import Config
 from ..core.runtime import Engine
 
 # Prefer narrative display helpers; fall back to plain logging.

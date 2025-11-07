@@ -19,8 +19,8 @@ from typing import Dict, Any
 import torch
 
 # Geometry + telemetry (kept as single‑source‑of‑truth)
-from .core.ledger import phase, rung_residual, half_click_margin  # exact circular tools
-from .core.telemetry import measure as _telemetry_measure         # κ, p_half, margins, step stats
+from ..core.ledger import phase, rung_residual, half_click_margin  # exact circular tools
+from ..core.telemetry import measure as _telemetry_measure         # κ, p_half, margins, step stats
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -202,8 +202,8 @@ if __name__ == "__main__":
     import argparse
     import json
 
-    from .config import Config
-    from .core.runtime import Engine
+    from ..utils.config import Config
+    from ..core.runtime import Engine
 
     ap = argparse.ArgumentParser(description="ElementFold • ledger diagnostics")
     ap.add_argument("--steps", type=int, default=50, help="micro‑train steps before measuring")

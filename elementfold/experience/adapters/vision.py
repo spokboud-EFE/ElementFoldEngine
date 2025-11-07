@@ -22,7 +22,7 @@ from typing import Tuple
 import torch
 
 from .base import AdapterRegistry
-from ...tokenizer import SimpleTokenizer
+from ...core.tokenizer import SimpleTokenizer
 
 # Optional import for mapping raw style → {beta,gamma,clamp}
 try:

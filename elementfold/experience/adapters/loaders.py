@@ -39,7 +39,7 @@ from elementfold.datasets.image_folder import (
 from elementfold.datasets.audio_folder import AudioFolderDataset
 
 # — Synthetic (local tiny pulse stream) —
-from elementfold.data import PulseDataset
+from elementfold.core.data import PulseDataset
 
 
 # ———————————————————————————————————————————————————————————

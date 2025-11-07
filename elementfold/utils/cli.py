@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from .config import Config
-from .core.runtime import Engine
-from .tokenizer import SimpleTokenizer
+from ..core.runtime import Engine
+from ..core.tokenizer import SimpleTokenizer
 
 # pretty tables when available
 try:
@@ -237,12 +237,12 @@ def main()->None:
         return
 
     if args.cmd=="studio":
-        from .experience.studio import studio_main
+        from ..experience.studio import studio_main
         _print_kv("⟲ ElementFold • Studio",{"hint":"Use Ctrl+C to exit; steering tips appear in UI."})
         studio_main(); return
 
     if args.cmd=="steering-train":
-        from .experience.steering_train import fit_steering
+        from ..experience.steering_train import fit_steering
         device=_coerce_device(args.device)
         ctrl=fit_steering(steps=args.steps,lr=args.lr,save_path=args.out,
                           delta=args.delta,batch_size=args.batch_size,

@@ -40,7 +40,7 @@ from typing import Dict, Optional, Callable, Tuple, Any
 import re
 import math
 
-from elementfold.rung_controller import RungController
+from elementfold.core.rung_controller import RungController
 from elementfold.core.control import Supervisor
 
 # New: adapter spec / readiness plumbing (compatible additions in base.py)
