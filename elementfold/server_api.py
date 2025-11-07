@@ -14,8 +14,9 @@ from __future__ import annotations
 import json, math
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Optional, Union
-from .data import PathSegment
 
+# Corrected import path
+from .core.data import PathSegment
 
 # ============================================================
 # Data schemas
@@ -77,6 +78,7 @@ class ErrorResponse:
 # ============================================================
 
 def parse_json(body: Union[str, bytes]) -> Dict[str, Any]:
+    """Decode JSON request body into a dict."""
     if not body:
         return {}
     if isinstance(body, bytes):
@@ -88,6 +90,7 @@ def parse_json(body: Union[str, bytes]) -> Dict[str, Any]:
 
 
 def _json_sanitize(x: Any) -> Any:
+    """Recursively replace NaN/Inf with finite safe values."""
     if isinstance(x, dict):
         return {k: _json_sanitize(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
@@ -98,6 +101,7 @@ def _json_sanitize(x: Any) -> Any:
 
 
 def to_json(obj: Any) -> bytes:
+    """Encode Python object → UTF-8 JSON bytes."""
     if hasattr(obj, "__dataclass_fields__"):
         obj = asdict(obj)
     obj = _json_sanitize(obj)
@@ -109,6 +113,7 @@ def to_json(obj: Any) -> bytes:
 # ============================================================
 
 def coerce_simulate_request(payload: Dict[str, Any]) -> SimulateRequest:
+    """Normalize a raw /simulate JSON body into a SimulateRequest."""
     shape = [int(x) for x in payload.get("shape", [64, 64])]
     spacing = [float(x) for x in payload.get("spacing", [1.0, 1.0])]
     bc = str(payload.get("bc", "neumann"))
@@ -127,6 +132,7 @@ def coerce_simulate_request(payload: Dict[str, Any]) -> SimulateRequest:
 
 
 def coerce_path_request(payload: Dict[str, Any]) -> PathRequest:
+    """Normalize /folds, /redshift, /brightness, or /bend path payload."""
     raw = payload.get("path", [])
     path = []
     for seg in raw:
@@ -147,10 +153,14 @@ def coerce_path_request(payload: Dict[str, Any]) -> PathRequest:
 def pack_simulate_response(phi: Any,
                            t: float,
                            metrics: Dict[str, float]) -> SimulateResponse:
+    """Convert numerical simulation output into a JSON-ready dataclass."""
     if hasattr(phi, "tolist"):
         phi = phi.tolist()
     return SimulateResponse(phi=phi, t=float(t), metrics=_json_sanitize(metrics))
 
 
-def pack_error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> ErrorResponse:
+def pack_error(code: str,
+               message: str,
+               details: Optional[Dict[str, Any]] = None) -> ErrorResponse:
+    """Pack a structured ErrorResponse."""
     return ErrorResponse(code=code, message=message, details=details)

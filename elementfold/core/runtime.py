@@ -18,7 +18,7 @@ from typing import Callable, Dict, Optional, Any
 from .data import FieldState
 from .model import RelaxationModel
 from .telemetry import summary as telemetry_summary
-from .helpers import verify as verify  # only for runtime invariants (optional)
+from ..helpers import verify as verify  # only for runtime invariants (optional)
 
 
 # ============================================================

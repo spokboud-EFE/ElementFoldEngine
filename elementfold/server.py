@@ -66,6 +66,16 @@ class Handler(BaseHTTPRequestHandler, BrainHandlerMixin, BrainLoopHandlerMixin):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
 
+    def _send_html(self, status: int, html: str) -> None:
+        """Send an HTML page with standard headers."""
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json(self, status: int, payload: Any) -> None:
         body = to_json(payload)
         self._set_headers(status)
@@ -86,9 +96,17 @@ class Handler(BaseHTTPRequestHandler, BrainHandlerMixin, BrainLoopHandlerMixin):
         self.end_headers()
 
     def do_GET(self) -> None:
+        if self.path == "/":
+            html = "<h1>🧠 ElementFold Physics Server</h1><p>Server running at /brain/loop/status</p>"
+            return self._send_html(200, html)
+        if self.path == "/brain/ui":
+           from .experience.studio_brain_panel_web import HTML
+           return self._send_html(200, HTML)
         if self.path == "/health":
             payload = {"status": "ok", "model_ready": True}
             return self._send_json(200, payload)
+        if self.path == "/brain/loop/status":
+            return self._handle_brain_loop_status()
         return self._send_error(404, "not_found", f"unknown GET path: {self.path}")
 
     def do_POST(self) -> None:

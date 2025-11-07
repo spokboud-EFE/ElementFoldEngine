@@ -1,9 +1,10 @@
 # ElementFold · utils/display.py
 # ============================================================
-# Console + Web telemetry display for physical simulations
+# Unified console + telemetry display for ElementFold
 # ------------------------------------------------------------
-# Provides colorized output and recent-buffer mirroring for dashboards.
-# Focus: runtime clarity for variance, gradient, and energy metrics.
+# • Handles colored logging with safe fallbacks (ASCII/TTY).
+# • Maintains a recent buffer mirrored to the web dashboard.
+# • Provides banner(), progress(), param(), etc.
 # ============================================================
 
 from __future__ import annotations
@@ -11,10 +12,28 @@ import os, sys, time, math, threading
 from collections import deque
 from typing import Any, Dict, List, Optional
 
+# ============================================================
+# Shared glyph set (used by console + Studio UI)
+# ============================================================
+
+GLYPHS: Dict[str, str] = {
+    "bar_fill": "█",
+    "bar_empty": "░",
+    "prog_fill": "█",
+    "prog_empty": "░",
+    "sep": "  ",
+}
+
+# ============================================================
+# Public interface
+# ============================================================
+
 __all__ = [
+    "GLYPHS",
     "banner", "progress", "format_seconds",
     "info", "success", "warn", "error", "debug",
-    "section", "param", "recent", "recent_json", "clear_recent"
+    "section", "param",
+    "recent", "recent_json", "clear_recent",
 ]
 
 # ============================================================
@@ -50,7 +69,7 @@ def _paint(txt: str, *styles: str) -> str:
     return "".join(styles) + txt + _C.RESET
 
 # ============================================================
-# Recent buffer (for web/Studio)
+# Recent buffer (for Studio mirror)
 # ============================================================
 
 _RECENT: deque[Dict[str, Any]] = deque(maxlen=600)
@@ -78,13 +97,14 @@ def clear_recent() -> None:
         _RECENT.clear()
 
 # ============================================================
-# Banners and progress
+# Banners, progress, and timers
 # ============================================================
 
 def banner(lambda_: float, D: float, phi_inf: float) -> str:
+    """Return one-line simulation banner."""
     return (
-        f"⟲ ElementFold Relaxation Engine ⟲  "
-        f"λ={lambda_:.3f}  D={D:.3f}  Φ∞={phi_inf:.3f}"
+        f"⟲ ElementFold Relaxation Engine ⟲{GLYPHS['sep']}"
+        f"λ={lambda_:.3f}{GLYPHS['sep']}D={D:.3f}{GLYPHS['sep']}Φ∞={phi_inf:.3f}"
     )
 
 def format_seconds(secs: float) -> str:
@@ -95,11 +115,12 @@ def format_seconds(secs: float) -> str:
 
 def progress(step: int, total: int, width: int = 30,
              prefix: str = "", start_time: Optional[float] = None) -> str:
+    """Progress bar for long-running simulations."""
     total = max(1, total)
     frac = min(max(step / total, 0.0), 1.0)
     w = max(1, width)
     k = int(round(w * frac))
-    bar = "█" * k + "░" * (w - k)
+    bar = GLYPHS["prog_fill"] * k + GLYPHS["prog_empty"] * (w - k)
     pct = f"{100.0 * frac:5.1f}%"
     eta = ""
     if start_time and step > 0:
@@ -134,7 +155,7 @@ def error(msg: str) -> None: _emit("ERR", msg)
 def debug(msg: str) -> None: _emit("DBG", msg)
 
 # ============================================================
-# Section headers and parameters
+# Section headers and parameter visualization
 # ============================================================
 
 def section(title: str) -> None:
@@ -148,7 +169,7 @@ def param(name: str,
           quality: str = "neutral",
           unit: Optional[str] = None,
           maxv: Optional[float] = None) -> None:
-    """Print one metric line (variance, energy, etc.)."""
+    """Render a single telemetry or control parameter."""
     color = {
         "good": _C.GREEN, "warn": _C.YELLOW, "bad": _C.RED,
         "neutral": _C.BLUE
@@ -164,9 +185,13 @@ def param(name: str,
         m = float(maxv)
         v = min(max(value, 0.0), m)
         filled = int(round(10 * v / m))
-        bar = "█" * filled + "░" * (10 - filled)
+        bar = GLYPHS["bar_fill"] * filled + GLYPHS["bar_empty"] * (10 - filled)
         txt += f" [{bar}]"
     if meaning:
         txt += f" — {meaning}"
     print(_paint(txt, color))
     _push("PARAM", txt)
+
+# ============================================================
+# End of file
+# ============================================================

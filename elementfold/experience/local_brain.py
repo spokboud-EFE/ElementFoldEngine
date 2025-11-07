@@ -1,34 +1,32 @@
 # ElementFold · experience/local_brain.py
 # ============================================================
-# Runtime-Aware Brain Interface
+# Runtime-Aware Brain Interface (Physics Runtime Edition)
 # ------------------------------------------------------------
 # Purpose:
 #   • Expose a JSON reasoning loop between an LLM and the ElementFold engine.
-#   • The model observes telemetry and config, proposes parameter changes,
-#     and receives feedback from the runtime.
+#   • The brain observes telemetry and config, proposes parameter changes,
+#     and receives feedback from the relaxation runtime.
 #
 # Public API:
 #   - LocalBrain(engine)
-#   - step()      → runs one observe→reason→act cycle
-#   - teach()     → loads a few canonical examples (prompt scaffolds)
+#   - step()      → runs one observe → reason → act cycle
+#   - teach()     → returns canonical prompt examples
 #
 # Notes:
-#   • This module is runtime-safe: no writes outside working dir.
-#   • Works with any background_model implementing .chat(messages=[...]).
+#   • Uses RelaxationModel as the runtime engine.
+#   • Works with any BackgroundModel implementing .chat(messages=[...]).
 # ============================================================
 
 from __future__ import annotations
 import json, time
 from typing import Any, Dict, Optional
 
-try:
-    from ..core.runtime import Engine
-    from ..utils.display import info, warn, success, debug
-    from ..core.telemetry import measure as measure_telemetry
-except Exception:
-    raise RuntimeError("LocalBrain requires core.runtime and utils.display")
+# Import the current physics runtime classes
+from ..core.model import RelaxationModel as Engine
+from ..utils.display import info, warn, success, debug
+from ..core.telemetry import summary as measure_telemetry
 
-# Optional model layer (can be local or remote)
+# Optional model layer (local or remote reasoning LLM)
 try:
     from .background_model import BackgroundModel
 except Exception:  # pragma: no cover
@@ -40,34 +38,27 @@ except Exception:  # pragma: no cover
 # ============================================================
 
 _BASE_PROMPT = """
-You are a runtime controller for the ElementFold simulation engine.
+You are a runtime controller for the ElementFold relaxation engine.
 
 You will receive:
-  1. The current telemetry of the field (variance, coherence, etc.).
+  1. The current telemetry of the field (variance, energy, coherence, etc.).
   2. The current configuration (lambda, D, phi_inf, dt).
-Your task is to reason and respond with *one JSON object* indicating
-what to do next. Valid actions:
+Your task is to respond with one JSON object describing what to do next.
 
+Valid actions:
   {"action":"adjust","params":{"lambda":0.3,"D":0.2},"comment":"Reduce lambda to slow relaxation."}
   {"action":"hold","comment":"Stable; no change."}
 
 Do not output text before or after the JSON.
 """
 
+
 # ============================================================
 # LocalBrain class
 # ============================================================
 
 class LocalBrain:
-    """
-    Bridge between Engine (simulation) and a text model (brain).
-
-    Steps:
-      1. Collect telemetry from engine.model (variance, etc.).
-      2. Query the background model with telemetry JSON.
-      3. Parse the JSON reply.
-      4. Apply parameter updates via engine.apply_control().
-    """
+    """Bridge between the physics runtime (Engine) and a text reasoning model."""
 
     def __init__(self, engine: Engine, *, model: Optional[Any] = None, verbose: bool = True):
         self.engine = engine
@@ -84,17 +75,19 @@ class LocalBrain:
 
     def _observe(self) -> Dict[str, Any]:
         try:
-            _, X = self.engine.infer(x=None, strategy="greedy")
-            tele = measure_telemetry(X, self.engine.cfg.delta)
-        except Exception:
-            tele = {"variance": None, "coherence": None}
-        cfg = {
-            "lambda": getattr(self.engine.cfg, "lambda_", None),
-            "D": getattr(self.engine.cfg, "D", None),
-            "phi_inf": getattr(self.engine.cfg, "phi_inf", None),
-            "dt": getattr(self.engine.cfg, "dt", None),
+            # Ask runtime for last state telemetry
+            tele = self.engine.telemetry(self.engine.background) if hasattr(self.engine, "telemetry") else {}
+        except Exception as e:
+            warn(f"Telemetry read failed: {e}")
+            tele = {}
+        cfg = getattr(self.engine, "background", None)
+        config = {
+            "lambda": getattr(cfg, "lambda_", None),
+            "D": getattr(cfg, "D", None),
+            "phi_inf": getattr(cfg, "phi_inf", None),
+            "dt": getattr(self.engine, "dt", None),
         }
-        return {"telemetry": tele, "config": cfg}
+        return {"telemetry": tele, "config": config}
 
     # --------------------------------------------------------
     # Reasoning: ask the model
@@ -103,7 +96,7 @@ class LocalBrain:
     def _query_brain(self, observation: Dict[str, Any]) -> Dict[str, Any]:
         msg = _BASE_PROMPT + "\nObservation:\n" + json.dumps(observation, indent=2)
         if self.model is None:
-            debug("Echo mode (no model).")
+            debug("Echo mode (no brain).")
             return {"action": "hold", "comment": "no brain available"}
 
         try:
@@ -131,8 +124,9 @@ class LocalBrain:
             D = params.get("D")
             phi_inf = params.get("phi_inf")
             if self.verbose:
-                info(f"Applying λ={lam} D={D} Φ∞={phi_inf}  — {comment}")
-            self.engine.apply_control(beta=lam, gamma=D, clamp=phi_inf)
+                info(f"Applying λ={lam}  D={D}  Φ∞={phi_inf}  — {comment}")
+            if hasattr(self.engine, "apply_control"):
+                self.engine.apply_control(beta=lam, gamma=D, clamp=phi_inf)
         elif act == "hold":
             if self.verbose:
                 debug(f"Holding parameters — {comment}")
@@ -144,22 +138,18 @@ class LocalBrain:
     # --------------------------------------------------------
 
     def step(self) -> Dict[str, Any]:
-        """
-        Run one full reasoning step (observe → reason → act).
-        Returns the brain's decision for logging.
-        """
+        """Run one full reasoning step (observe → reason → act)."""
         obs = self._observe()
         decision = self._query_brain(obs)
         self._act(decision)
         return decision
 
     # --------------------------------------------------------
-    # Teaching examples (optional)
+    # Teaching examples
     # --------------------------------------------------------
 
     @staticmethod
     def teach() -> Dict[str, Any]:
-        """Return example observation→action pairs for prompting."""
         return {
             "examples": [
                 {
@@ -170,7 +160,11 @@ class LocalBrain:
                 {
                     "telemetry": {"variance": 0.1, "coherence": 0.7},
                     "config": {"lambda": 0.2, "D": 0.1},
-                    "expected": {"action": "adjust", "params": {"D": 0.18}, "comment": "increase diffusion"},
+                    "expected": {
+                        "action": "adjust",
+                        "params": {"D": 0.18},
+                        "comment": "increase diffusion",
+                    },
                 },
             ]
         }
@@ -181,10 +175,9 @@ class LocalBrain:
 # ============================================================
 
 if __name__ == "__main__":
-    from ..core.runtime import Engine
     from ..utils.config import Config
     cfg = Config()
-    eng = Engine(cfg)
+    eng = Engine(cfg.background, cfg.device if hasattr(cfg, "device") else None)
     brain = LocalBrain(eng)
     for i in range(3):
         print(f"\n— Step {i+1} —")

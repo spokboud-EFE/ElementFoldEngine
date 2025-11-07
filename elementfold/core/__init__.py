@@ -1,58 +1,19 @@
-# ElementFold · core/__init__.py
-# ============================================================
-# Core package — the coherent engine of ElementFold.
-#
-# Contains:
-#   • fgn.py         → Fold–Gate–Norm kernel (FGNBlock, Gate, Norm)
-#   • model.py       → Model backbone (FGN stack + rotary)
-#   • variational.py → Variational ledger (convex spacing law)
-#   • ledger.py      → δ⋆-circle geometry & kernels
-#   • control.py     → Supervisor (β, γ, ⛔ controller)
-#   • telemetry.py   → Coherence metrics (κ, p½, etc.)
-#   • runtime.py     → Engine orchestration spine
-#
-# This package can run entirely stand-alone with PyTorch + stdlib.
-# ============================================================
+# elementfold/core/__init__.py  (modern physics API)
 
-from __future__ import annotations
+from . import data, control, fgn, telemetry, quantize, runtime
 
-# Core engine primitives
-from .fgn import FGNBlock, Gate, Norm, FoldGrid
-from .model import Model
-from .variational import VariationalLedger
-from .ledger import (
-    phase,
-    rung_residual,
-    half_click_margin,
-    snap_to_rung,
-    seat_index,
-    seat_index_int,
-    wrapped_distance,
-    periodic_mean,
-    periodic_lerp,
-    char_kernel,
-    vm_kernel,
-    invariants,
-    check_identities,
-    kappa,
-    p_half,
-)
-from .control import Supervisor
-from .telemetry import measure, normalize, pretty
-from .runtime import Engine
+# control (PDE)
+from .control import safe_dt, step, step_torch, step_semi_implicit, Controller
+
+# folds / observables
+from .fgn import folds, redshift_from_F, brightness_tilt, time_dilation, bend
+
+# telemetry
+from .telemetry import summary as telemetry_summary, variance, grad_L2, total_energy
 
 __all__ = [
-    # Core compute blocks
-    "FoldGrid", "Gate", "Norm", "FGNBlock",
-    # Models
-    "Model", "VariationalLedger",
-    # Ledger geometry
-    "phase", "rung_residual", "half_click_margin", "snap_to_rung",
-    "seat_index", "seat_index_int", "wrapped_distance",
-    "periodic_mean", "periodic_lerp",
-    "char_kernel", "vm_kernel",
-    "invariants", "check_identities",
-    "kappa", "p_half",
-    # Control / telemetry / runtime
-    "Supervisor", "measure", "normalize", "pretty", "Engine",
+    "data", "control", "fgn", "telemetry", "quantize", "runtime",
+    "safe_dt", "step", "step_torch", "step_semi_implicit", "Controller",
+    "folds", "redshift_from_F", "brightness_tilt", "time_dilation", "bend",
+    "telemetry_summary", "variance", "grad_L2", "total_energy",
 ]
