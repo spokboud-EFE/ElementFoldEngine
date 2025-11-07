@@ -16,6 +16,7 @@
 from __future__ import annotations
 import argparse, json, traceback
 from http.server import BaseHTTPRequestHandler
+from .server_brain import BrainHandlerMixin
 try:
     from http.server import ThreadingHTTPServer as HTTPServer
 except Exception:
@@ -54,7 +55,7 @@ def _model() -> RelaxationModel:
 # HTTP handler
 # ============================================================
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler, BrainHandlerMixin):
 
     def _set_headers(self, status: int = 200, content_type: str = "application/json") -> None:
         self.send_response(status)
@@ -135,6 +136,9 @@ class Handler(BaseHTTPRequestHandler):
                 model = _model()
                 dtheta = bend([seg for seg in req.path], model.optics.n)
                 return self._send_json(200, BendResponse(dtheta=dtheta))
+            
+            if path == "/brain/step":
+                return self._handle_brain_step(data)
 
             return self._send_error(404, "not_found", f"unknown POST path: {path}")
 
