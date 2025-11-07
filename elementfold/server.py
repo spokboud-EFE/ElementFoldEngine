@@ -1,208 +1,183 @@
-# ElementFold · server.py
-# ============================================================
-# Lightweight HTTP server exposing the relaxation model.
-# ------------------------------------------------------------
-# Endpoints (JSON):
-#   • GET  /health
-#   • POST /simulate   → evolve Φ for N steps
-#   • POST /folds      → integrate ℱ
-#   • POST /redshift   → compute 1+z = e^ℱ − 1
-#   • POST /brightness → apply brightness tilt
-#   • POST /bend       → compute color-dependent deflection
-#
-# Uses only stdlib http.server + core.server_api helpers.
-# ============================================================
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ ElementFold · server.py                                                      ║
+# ║──────────────────────────────────────────────────────────────────────────────║
+# ║  Lightweight HTTP interface to the relaxation core and Studio telemetry.     ║
+# ║                                                                              ║
+# ║  Endpoints (JSON):                                                           ║
+# ║   • GET  /health        → minimal readiness check                            ║
+# ║   • GET  /diag          → full diagnostic snapshot (mode + narrative)        ║
+# ║   • POST /mode          → switch between "shaping" / "forcing"               ║
+# ║   • POST /simulate      → evolve Φ for N steps                               ║
+# ║   • GET  /telemetry     → raw live physics metrics                           ║
+# ║   • GET  /adapters      → list registered adapters                           ║
+# ║                                                                              ║
+# ║  Narrative telemetry preserved:                                              ║
+# ║   β, γ, ⛔, κ, λ, D, ∇Φ — all accompanied by short textual descriptions.     ║
+# ║                                                                              ║
+# ║  Uses only Python stdlib http.server.                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 
 from __future__ import annotations
-import argparse, json, traceback
-from http.server import BaseHTTPRequestHandler
-from .server_brain import BrainHandlerMixin
-from .server_brain_loop import BrainLoopHandlerMixin
-from elementfold.core import data
-try:
-    from http.server import ThreadingHTTPServer as HTTPServer
-except Exception:
-    from http.server import HTTPServer
+import json, argparse, time, traceback, logging
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from elementfold.core import runtime, control, telemetry
+from elementfold.experience.adapters.base import AdapterRegistry
 
-from .server_api import (
-    parse_json, to_json,
-    coerce_simulate_request, coerce_path_request,
-    pack_simulate_response, pack_error,
-    SimulateResponse, FoldsResponse,
-    RedshiftResponse, BrightnessResponse, BendResponse,
-)
-from .core.model import RelaxationModel
-from .core.data import default_background, default_optics, FieldState
-from .core.runtime import simulate_once
-from .core.fgn import folds, redshift_from_F, brightness_tilt, bend
+# ────────────────────────────────────────────────────────────────────────────────
+# Global initialization
+# ────────────────────────────────────────────────────────────────────────────────
+_ENGINE = runtime.init_engine()
+_START_TIME = time.time()
 
+LOG = logging.getLogger("elementfold.server")
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-# ============================================================
-# Global model singleton (lazy init)
-# ============================================================
-
-_MODEL: RelaxationModel | None = None
-
-def _model() -> RelaxationModel:
-    global _MODEL
-    if _MODEL is None:
-        bg = default_background()
-        optics = default_optics()
-        _MODEL = RelaxationModel(background=bg, optics=optics)
-    return _MODEL
+# ────────────────────────────────────────────────────────────────────────────────
+# Custom lightweight exceptions
+# ────────────────────────────────────────────────────────────────────────────────
+class BadRequest(ValueError): ...
+class NotFound(LookupError): ...
+class ModeError(ValueError): ...
 
 
-# ============================================================
-# HTTP handler
-# ============================================================
+# ────────────────────────────────────────────────────────────────────────────────
+# HTTP Handler
+# ────────────────────────────────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    """HTTP surface of the ElementFold runtime — minimal, human, narrative."""
 
-class Handler(BaseHTTPRequestHandler, BrainHandlerMixin, BrainLoopHandlerMixin):
-    def _engine(self):
-        """Return the shared global RelaxationModel instance."""
-        try:
-            return _model()   # reuse the singleton defined at the top
-        except Exception as e:
-            print("[server] Engine init failed:", e)
-            return None
-
-
-    def _set_headers(self, status: int = 200, content_type: str = "application/json") -> None:
+    def _json(self, status: int, payload: Any) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
-
-    def _send_html(self, status: int, html: str) -> None:
-        """Send an HTML page with standard headers."""
-        body = html.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _send_json(self, status: int, payload: Any) -> None:
-        body = to_json(payload)
-        self._set_headers(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_error(self, status: int, code: str, message: str) -> None:
-        self._send_json(status, pack_error(code, message))
+    def _error(self, status: int, code: str, msg: str) -> None:
+        self._json(status, {"error": {"code": code, "message": msg}})
 
-    def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length) if length > 0 else b""
-        return parse_json(body)
+    def _safe_json(self) -> dict:
+        """Parse JSON safely with clear error messages."""
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw or "{}")
+        except json.JSONDecodeError as e:
+            raise BadRequest(f"Invalid JSON: {e.msg}")
 
-    def do_OPTIONS(self) -> None:
-        self._set_headers(204)
-        self.end_headers()
-
+    # ────────────────────────────────────────────────────────────────────────────
+    # GET routes
+    # ────────────────────────────────────────────────────────────────────────────
     def do_GET(self) -> None:
-        if self.path == "/":
-            html = "<h1>🧠 ElementFold Physics Server</h1><p>Server running at /brain/loop/status</p>"
-            return self._send_html(200, html)
-        if self.path == "/brain/ui":
-           from .experience.studio_brain_panel_web import HTML
-           return self._send_html(200, HTML)
-        if self.path == "/health":
-            payload = {"status": "ok", "model_ready": True}
-            return self._send_json(200, payload)
-        if self.path == "/brain/loop/status":
-            return self._handle_brain_loop_status()
-        return self._send_error(404, "not_found", f"unknown GET path: {self.path}")
+        try:
+            if self.path == "/health":
+                return self._json(200, {"status": "ok", "message": "ElementFold core responsive."})
 
+            if self.path == "/telemetry":
+                snap = telemetry.snapshot()
+                snap["narrative"] = telemetry.narrate(snap)
+                return self._json(200, snap)
+
+            if self.path == "/adapters":
+                return self._json(200, {"adapters": AdapterRegistry.list_all()})
+
+            if self.path == "/diag":
+                physics = telemetry.snapshot()
+                physics["narrative"] = telemetry.narrate(physics)
+                payload = {
+                    "studio": {
+                        "mode": control.get_mode(),
+                        "uptime_sec": round(time.time() - _START_TIME, 2),
+                        "symbol": "🎛️"
+                    },
+                    "physics": physics,
+                    "adapters": {
+                        "registered": AdapterRegistry.list_all(),
+                        "active": AdapterRegistry.active()
+                    },
+                    "brains": telemetry.brain_status(),
+                    "env": telemetry.env_status(),
+                    "version": telemetry.version_info(),
+                }
+                return self._json(200, payload)
+
+            raise NotFound(self.path)
+
+        except NotFound as nf:
+            return self._error(404, "not_found", f"unknown path: {nf}")
+        except Exception as e:
+            LOG.error("Unhandled GET error: %s", e)
+            LOG.debug(traceback.format_exc())
+            return self._error(500, "internal_error", "unexpected server error")
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # POST routes
+    # ────────────────────────────────────────────────────────────────────────────
     def do_POST(self) -> None:
         try:
-            path = self.path
-            data = self._read_json()
+            data = self._safe_json()
 
-            if path == "/simulate":
-                req = coerce_simulate_request(data)
-                bg = default_background(req.lambda_, req.D, req.phi_inf)
-                optics = default_optics()
-                model = RelaxationModel(background=bg, optics=optics)
-                phi0 = FieldState(phi=np.zeros(req.shape, float),
-                                  t=0.0,
-                                  spacing=tuple(req.spacing),
-                                  bc=req.bc)
-                out = simulate_once(model, phi0, steps=req.steps, dt=req.dt)
-                resp = pack_simulate_response(out["state"].phi,
-                                              out["state"].t,
-                                              out["metrics"])
-                return self._send_json(200, resp)
+            if self.path == "/mode":
+                mode = data.get("mode")
+                if mode not in ("shaping", "forcing"):
+                    raise ModeError("mode must be 'shaping' or 'forcing'")
+                control.set_mode(mode)
+                phrase = (
+                    "gentle shaping — coherence guided."
+                    if mode == "shaping"
+                    else "direct forcing — field depinned for manual intervention."
+                )
+                return self._json(200, {
+                    "ok": True,
+                    "mode": control.get_mode(),
+                    "narrative": f"⚙️ Mode switched to {mode}: {phrase}"
+                })
 
-            if path == "/folds":
-                req = coerce_path_request(data)
-                model = _model()
-                F = folds([seg for seg in req.path], model.optics.eta)
-                return self._send_json(200, FoldsResponse(F=F))
+            if self.path == "/simulate":
+                result = runtime.step(data)
+                result["narrative"] = telemetry.narrate(result)
+                return self._json(200, result)
 
-            if path == "/redshift":
-                req = coerce_path_request(data)
-                model = _model()
-                F = folds([seg for seg in req.path], model.optics.eta)
-                z = redshift_from_F(F)
-                return self._send_json(200, RedshiftResponse(z=z))
+            raise NotFound(self.path)
 
-            if path == "/brightness":
-                req = coerce_path_request(data)
-                model = _model()
-                F = folds([seg for seg in req.path], model.optics.eta)
-                I_emit = float(data.get("I_emit", 1.0))
-                d_geom = float(data.get("d_geom", 1.0))
-                I_obs = I_emit / (4.0 * 3.14159 * d_geom ** 2) * float(brightness_tilt(F))
-                return self._send_json(200, BrightnessResponse(I_obs=I_obs))
-
-            if path == "/bend":
-                req = coerce_path_request(data)
-                model = _model()
-                dtheta = bend([seg for seg in req.path], model.optics.n)
-                return self._send_json(200, BendResponse(dtheta=dtheta))
-            
-            if path == "/brain/step":
-                return self._handle_brain_step(data)
-        
-            if path == "/brain/loop/start":
-                return self._handle_brain_loop_start(data)
-            if path == "/brain/loop/stop":
-                return self._handle_brain_loop_stop(data)
-
-            return self._send_error(404, "not_found", f"unknown POST path: {path}")
-
-        except ValueError as e:
-            return self._send_error(400, "bad_json", str(e))
+        except BadRequest as e:
+            return self._error(400, "bad_request", str(e))
+        except ModeError as e:
+            return self._error(400, "bad_mode", str(e))
+        except NotFound as nf:
+            return self._error(404, "not_found", f"unknown path: {nf}")
         except Exception as e:
-            self.log_message("error: %s\n%s", repr(e), traceback.format_exc())
-            return self._send_error(500, "internal_error", str(e))
+            LOG.error("Unhandled POST error: %s", e)
+            LOG.debug(traceback.format_exc())
+            return self._error(500, "internal_error", "unexpected server error")
 
 
-# ============================================================
+# ────────────────────────────────────────────────────────────────────────────────
 # Entry point
-# ============================================================
-
+# ────────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    p = argparse.ArgumentParser(description="ElementFold relaxation HTTP server")
-    p.add_argument("--host", type=str, default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8081)
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description="ElementFold relaxation server")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8081)
+    args = ap.parse_args()
 
-    from .utils.bootstrap import bootstrap_brain_env
-    bootstrap_brain_env(interactive=True)
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print(f"║  🧠  ElementFold Server active on  http://{args.host}:{args.port:<5}            ║")
+    print("║  Use  /diag  for full system state,  /mode  to toggle forcing/shaping.║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
 
-    srv = HTTPServer((args.host, args.port), Handler)
-    print(f"⟲ ElementFold physics server ready at http://{args.host}:{args.port}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        pass
+        print("\n[server] Shutting down gracefully.")
     finally:
         srv.server_close()
+
 
 if __name__ == "__main__":
     main()
