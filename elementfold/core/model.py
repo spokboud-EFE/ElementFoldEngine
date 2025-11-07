@@ -1,210 +1,173 @@
-# ElementFold · model.py
+# ElementFold · core/model.py
 # ============================================================
-# ElementFold Model — from tokens to ledger.
+# RelaxationModel — unified physical interface
+# ------------------------------------------------------------
+# Combines:
+#   • Field evolution (Φ)
+#   • Fold / redshift / brightness calculations
+#   • Energy and variance telemetry
 #
-# Pipeline
-# --------
-#   Stem (Embedding)
-#   → RotaryClick (per‑timestep phase rotation)
-#   → [FGNBlock] × L (Fold–Gate–Norm coherence engine)
-#   → LayerNorm
-#   → Heads: {lm logits, ledger scalar}
-#
-# Forward:
-#   (B,T) int64  →  logits:(B,T,V),  X:(B,T)
-#
-# Control passthrough:
-#   apply_control(beta=?, gamma=?, clamp=?)
+# Uses only NumPy (Torch optional for acceleration).
 # ============================================================
 
 from __future__ import annotations
-import math
-from typing import Tuple
+import numpy as np
+from typing import Callable, Optional, Dict, Any, Tuple
 
-import torch
-import torch.nn as nn
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
-from .fgn import FGNBlock  # Fold–Gate–Norm unit
-
-__all__ = ["RotaryClick", "Model"]
+from .data import BackgroundParams, OpticalParams, FieldState, Path
+from .control import step, step_torch, safe_dt
+from .telemetry import summary as telemetry_summary, monotone_var_drop
+from .fgn import folds, redshift_from_F, brightness_tilt, time_dilation, bend
 
 
 # ============================================================
-# 1) RotaryClick — deterministic per‑time phase rotation
+# RelaxationModel class
 # ============================================================
 
-class RotaryClick(nn.Module):
+class RelaxationModel:
     """
-    Rotate feature lanes in pairs with an angle that depends only on time step t.
+    Unified numerical model of the relaxation field.
 
-    For each t (0..T-1) and each feature pair (A,B):
-        [A'; B'] = [ cos θ_t  -sin θ_t ] [A; B]
-                   [ sin θ_t   cos θ_t ]
-    with θ_t = t * (2π * δ).
+    Components
+    ----------
+    background : BackgroundParams
+    optics     : OpticalParams
 
-    Notes
-    -----
-    * Operates in float32 for the trig, then casts back to x.dtype (safe for fp16/bf16).
-    * If D is odd, the last channel is passed through unchanged.
-    """
-    def __init__(self, dim: int, delta: float = 0.03):
-        super().__init__()
-        self.dim = int(dim)
-        self.delta = float(delta)
-        self._theta = 2.0 * math.pi * self.delta
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args
-        ----
-        x : (B, T, D)
-
-        Returns
-        -------
-        (B, T, D) rotated in feature pairs per timestep.
-        """
-        B, T, D = x.shape
-        if D < 2 or T == 0:
-            return x
-
-        even = (D // 2) * 2
-        # Time-dependent angles computed in float32 for stability.
-        t = torch.arange(T, dtype=torch.float32, device=x.device)
-        c = torch.cos(t * self._theta).view(1, T, 1, 1)
-        s = torch.sin(t * self._theta).view(1, T, 1, 1)
-        if x.dtype != torch.float32:
-            c = c.to(torch.float32)
-            s = s.to(torch.float32)
-
-        # Rotate pairs [A,B] along the last dimension.
-        x_head = x[:, :, :even].reshape(B, T, even // 2, 2).to(torch.float32)
-        A, Bp = x_head[..., 0:1], x_head[..., 1:2]
-        Ar = A * c - Bp * s
-        Br = A * s + Bp * c
-        rotated = torch.cat([Ar, Br], dim=-1).reshape(B, T, even).to(x.dtype)
-
-        if even == D:
-            return rotated
-        # Pass through last (odd) channel unchanged.
-        tail = x[:, :, even:]
-        return torch.cat([rotated, tail], dim=-1)
-
-
-# ============================================================
-# 2) ElementFold Model — tokens → (logits, ledger)
-# ============================================================
-
-class Model(nn.Module):
-    """
-    Stem → RotaryClick → [FGN]×L → LayerNorm → {lm head, ledger head}
-
-    Outputs
+    Methods
     -------
-    logits : (B, T, V)
-    X      : (B, T)
+    evolve(state, steps|dt)     – integrate PDE
+    folds(path)                 – integrate cumulative folds
+    redshift(path)              – compute 1+z = e^F − 1
+    brightness(path, I_emit, d_geom)
+    time_dilation(path)
+    bend(path)
+    telemetry(state)            – compute variance, grad², energy
     """
-    def __init__(
-        self,
-        vocab: int = 256,
-        d: int = 128,
-        layers: int = 4,
-        heads: int = 4,         # kept for interface symmetry; not used here
-        seq_len: int = 128,
-        fold: str = "grid",     # retained for config visibility
-        delta: float = 0.03,
-    ):
-        super().__init__()
-        # Public config (int-cast to avoid surprises when loading from yaml/json)
-        self.vocab = int(vocab)
-        self.d = int(d)
-        self.layers = int(layers)
-        self.heads = int(heads)
-        self.seq_len = int(seq_len)
-        self.fold = str(fold)
-        self.delta = float(delta)
 
-        # --- Stem ---
-        self.emb = nn.Embedding(self.vocab, self.d)
-        self.rot = RotaryClick(self.d, self.delta)
+    def __init__(self,
+                 background: BackgroundParams,
+                 optics: Optional[OpticalParams] = None,
+                 use_torch: bool = False) -> None:
+        self.background = background
+        self.optics = optics
+        self.use_torch = bool(use_torch and TORCH_AVAILABLE)
 
-        # --- Core ---
-        self.blocks = nn.ModuleList([FGNBlock(self.d) for _ in range(self.layers)])
-
-        # --- Heads ---
-        self.norm = nn.LayerNorm(self.d)
-        self.lm = nn.Linear(self.d, self.vocab)    # token logits
-        self.ledger = nn.Linear(self.d, 1)         # scalar per token
-        self._last_control = {"beta": None, "gamma": None, "clamp": None}
-
-        self._init_weights()
-
-    # --------------------------------------------------------
-    # Forward
-    # --------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # ------------------------------------------------------------
+    # PDE evolution
+    # ------------------------------------------------------------
+    def evolve(self,
+               state: FieldState,
+               steps: Optional[int] = None,
+               dt: Optional[float] = None,
+               hooks: Optional[Dict[str, Callable]] = None) -> FieldState:
         """
-        Parameters
-        ----------
-        x : LongTensor (B, T)
-            Token ids.
-
-        Returns
-        -------
-        logits : FloatTensor (B, T, V)
-        X      : FloatTensor (B, T)
+        Advance Φ for given number of steps (or until stability).
+        Hooks may include 'on_step(state, metrics)'.
         """
-        h = self.emb(x)              # (B,T,D)
-        h = self.rot(h)              # (B,T,D)
-        for blk in self.blocks:
-            h = blk(h)               # (B,T,D)
-        h = self.norm(h)             # (B,T,D)
+        lam, D, phi_inf = self.background.lambda_, self.background.D, self.background.phi_inf
+        spacing, bc = state.spacing, state.bc
 
-        logits = self.lm(h)          # (B,T,V)
-        X = self.ledger(h).squeeze(-1)  # (B,T)
-        return logits, X
+        # Compute safe dt if none
+        if dt is None:
+            dt = safe_dt(lam, D, spacing)
 
-    # --------------------------------------------------------
-    # Control interface — propagate β, γ, ⛔ to all FGN blocks
-    # --------------------------------------------------------
-    def apply_control(self, beta=None, gamma=None, clamp=None) -> None:
-        """
-        Push external coherence controls into internal FGN blocks.
-        """
-        self._last_control = {"beta": beta, "gamma": gamma, "clamp": clamp}
-        for blk in self.blocks:
-            if hasattr(blk, "apply_control") and callable(blk.apply_control):
-                blk.apply_control(beta=beta, gamma=gamma, clamp=clamp)
+        phi = state.phi.copy()
+        t = state.t
+        n_steps = int(steps or 1)
+        on_step = None if not hooks else hooks.get("on_step")
+
+        for _ in range(n_steps):
+            if self.use_torch:
+                phi_t = torch.as_tensor(phi, dtype=torch.float32)
+                phi_next = step_torch(phi_t, lam, D, phi_inf, spacing, bc, dt).cpu().numpy()
             else:
-                # Best-effort fill for compatible attributes
-                with torch.no_grad():
-                    gate = getattr(blk, "gate", None)
-                    if gate is not None:
-                        if beta is not None and hasattr(gate, "beta"):
-                            gate.beta.fill_(float(beta))
-                        if clamp is not None and hasattr(gate, "clamp"):
-                            gate.clamp.fill_(float(clamp))
-                    norm = getattr(blk, "norm", None)
-                    if norm is not None and gamma is not None:
-                        if hasattr(norm, "gamma"):
-                            norm.gamma.fill_(float(gamma))
-                        elif hasattr(norm, "weight"):
-                            norm.weight.fill_(float(gamma))
+                phi_next = step(phi, lam, D, phi_inf, spacing, bc, dt)
+            # Check monotonic variance
+            if not monotone_var_drop(phi, phi_next):
+                dt *= 0.5  # shrink dt for safety
+            phi = phi_next
+            t += dt
+            if on_step:
+                metrics = self.telemetry(FieldState(phi, t, spacing, bc))
+                on_step(FieldState(phi, t, spacing, bc), metrics)
 
-    def last_control(self) -> dict:
-        """Return most recently applied β, γ, ⛔ (for dashboards/telemetry)."""
-        return dict(self._last_control)
+        return FieldState(phi=phi, t=t, spacing=spacing, bc=bc)
 
-    # --------------------------------------------------------
-    # Initialization
-    # --------------------------------------------------------
-    def _init_weights(self) -> None:
-        # Embedding & heads: small-norm init; ledger starts near 0 signal.
-        nn.init.normal_(self.emb.weight, std=0.02)
+    # ------------------------------------------------------------
+    # Fold and observable wrappers
+    # ------------------------------------------------------------
+    def folds(self, path: Path) -> float:
+        """Integrate ℱ along a path using current optics. Requires optics.eta."""
+        if not self.optics:
+            raise ValueError("Optical parameters required for folds().")
+        return folds(path, self.optics.eta)
 
-        nn.init.normal_(self.lm.weight, std=0.02)
-        if self.lm.bias is not None:
-            nn.init.zeros_(self.lm.bias)
+    def redshift(self, path: Path) -> float:
+        """Compute redshift 1+z = e^ℱ - 1."""
+        F = self.folds(path)
+        return float(redshift_from_F(F))
 
-        nn.init.zeros_(self.ledger.weight)
-        if self.ledger.bias is not None:
-            nn.init.zeros_(self.ledger.bias)
+    def brightness(self, path: Path, I_emit: float, d_geom: float) -> float:
+        """Compute observed brightness including geometric and relaxation terms."""
+        F = self.folds(path)
+        return float(I_emit / (4.0 * np.pi * d_geom ** 2) * brightness_tilt(F))
+
+    def time_dilation(self, path: Path) -> float:
+        """Compute apparent time dilation along a path."""
+        if not self.optics:
+            raise ValueError("Optical parameters required.")
+        F = self.folds(path)
+        sigma_obs = self.optics.sigma(0.0)
+        sigma_emit = self.optics.sigma(path[0].phi)
+        return float(time_dilation(F, sigma_obs, sigma_emit))
+
+    def bend(self, path: Path) -> float:
+        """Compute chromatic bending via ∇⊥ ln n."""
+        if not self.optics:
+            raise ValueError("Optical parameters required.")
+        return float(bend(path, self.optics.n))
+
+    # ------------------------------------------------------------
+    # Telemetry and diagnostics
+    # ------------------------------------------------------------
+    def telemetry(self, state: FieldState) -> Dict[str, float]:
+        """Return variance, grad², energy summary for the field."""
+        lam, D, phi_inf = self.background.lambda_, self.background.D, self.background.phi_inf
+        return telemetry_summary(state.phi, lam, D, phi_inf, state.spacing, state.bc)
+
+    # ------------------------------------------------------------
+    # Convenience wrappers for simulation
+    # ------------------------------------------------------------
+    def simulate(self,
+                 state: FieldState,
+                 steps: int,
+                 dt: Optional[float] = None,
+                 hooks: Optional[Dict[str, Callable]] = None) -> Dict[str, Any]:
+        """Run simulation and return final state and telemetry."""
+        final_state = self.evolve(state, steps=steps, dt=dt, hooks=hooks)
+        metrics = self.telemetry(final_state)
+        return {"state": final_state, "metrics": metrics}
+
+    # ------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "background": self.background.as_dict(),
+            "optics": self.optics.as_dict() if self.optics else None,
+            "use_torch": self.use_torch,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "RelaxationModel":
+        bg = BackgroundParams(**d["background"])
+        optics = None
+        if d.get("optics"):
+            optics = OpticalParams(**d["optics"])
+        return cls(background=bg, optics=optics, use_torch=bool(d.get("use_torch", False)))

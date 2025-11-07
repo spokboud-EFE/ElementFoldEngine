@@ -1,224 +1,169 @@
-# ElementFold · control.py
+# ElementFold · core/control.py
 # ============================================================
-# Supervisor — feedback controller that keeps Fold–Gate–Norm in tune.
+# PDE controller — stable explicit update for the relaxation field
+# ------------------------------------------------------------
+# Evolves:
+#     ∂Φ/∂t = -λ(Φ - Φ∞) + D∇²Φ
 #
-# Controls (published):
-#   β (beta)   — exposure: amplifies structure/flow
-#   γ (gamma)  — damping : calms excess energy
-#   ⛔ (clamp) — gate cap : limits negative-side depth
-#
-# Telemetry (inputs; ASCII or Unicode keys accepted):
-#   'kappa' or 'κ'      — phase concentration in [0,1]
-#   'p_half' or 'p½'    — proximity to half-click boundary
-#   'grad_norm'         — gradient magnitude proxy
-#   optional: 'x_mean' + 'delta'/'δ⋆' to derive p½ when missing
-#
-# Behavior:
-#   • Small, EMA-smoothed incremental updates (no bangs or oscillations)
-#   • Safety rails clip β,γ,⛔ into stable ranges
-#   • Pure stdlib; deterministic and dependency-free
+# Responsibilities:
+#   • compute safe dt given λ, D, and grid spacing
+#   • perform one explicit (or semi-implicit) step
+#   • automatically use torch when available, else NumPy
 # ============================================================
 
 from __future__ import annotations
 import math
-from typing import Dict, Optional, Mapping
+import numpy as np
+from typing import Tuple, Literal, Optional, Dict
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+from .quantize import laplacian, laplacian_torch
 
 
-class Supervisor:
+# ============================================================
+# Utility: compute safe dt
+# ============================================================
+
+def safe_dt(lambda_: float,
+            D: float,
+            spacing: Tuple[float, ...],
+            safety: float = 0.8) -> float:
     """
-    Stateful feedback controller for the Fold–Gate–Norm engine.
-
-    Usage
-    -----
-        sup = Supervisor()
-        ctrl = sup.update(telemetry)     # -> {'beta','gamma','clamp'}
-        sup.apply(model)                 # if model implements .apply_control(...)
+    Return a numerically stable explicit step size for the relaxation PDE.
+    CFL-like bound:
+        dt ≤ safety / (λ + 2D∑(1/Δx_i²))
     """
+    inv_sq = sum((1.0 / (dx * dx)) for dx in spacing)
+    denom = max(lambda_ + 2.0 * D * inv_sq, 1e-12)
+    return safety / denom
 
+
+# ============================================================
+# Main explicit stepper
+# ============================================================
+
+def step(phi: np.ndarray,
+         lambda_: float,
+         D: float,
+         phi_inf: float,
+         spacing: Tuple[float, ...],
+         bc: Literal["neumann", "periodic"] = "neumann",
+         dt: Optional[float] = None,
+         safety: float = 0.8) -> np.ndarray:
+    """
+    Perform one relaxation update step on Φ (NumPy version).
+    If dt is None, an automatically safe dt is computed.
+    """
+    if dt is None:
+        dt = safe_dt(lambda_, D, spacing, safety)
+    lap = laplacian(phi, spacing, bc)
+    phi_next = phi + dt * (-lambda_ * (phi - phi_inf) + D * lap)
+    return phi_next
+
+
+# ============================================================
+# Torch variant (auto GPU if available)
+# ============================================================
+
+def step_torch(phi,
+               lambda_: float,
+               D: float,
+               phi_inf: float,
+               spacing: Tuple[float, ...],
+               bc: Literal["neumann", "periodic"] = "neumann",
+               dt: Optional[float] = None,
+               safety: float = 0.8) -> "torch.Tensor":
+    """
+    Torch version of the explicit PDE update.
+    """
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("Torch not available; use step() instead.")
+    if dt is None:
+        dt = safe_dt(lambda_, D, spacing, safety)
+    lap = laplacian_torch(phi, spacing, bc)
+    return phi + dt * (-lambda_ * (phi - phi_inf) + D * lap)
+
+
+# ============================================================
+# Semi-implicit (optional) stepper for stiff regimes
+# ============================================================
+
+def step_semi_implicit(phi: np.ndarray,
+                       lambda_: float,
+                       D: float,
+                       phi_inf: float,
+                       spacing: Tuple[float, ...],
+                       bc: Literal["neumann", "periodic"] = "neumann",
+                       dt: Optional[float] = None,
+                       safety: float = 0.8) -> np.ndarray:
+    """
+    Crank–Nicolson-like semi-implicit update for stiff λ,D.
+    Solves (I - dt·D·∇²)Φ_{t+1} = Φ_t + dt·λ·Φ∞ - dt·λ·Φ_t
+    Approximate with one Jacobi iteration (good enough for moderate stiffness).
+    """
+    if dt is None:
+        dt = safe_dt(lambda_, D, spacing, safety)
+    lap = laplacian(phi, spacing, bc)
+    rhs = phi + dt * (-lambda_ * (phi - phi_inf) + D * lap)
+    corr = dt * D * laplacian(rhs, spacing, bc)
+    phi_next = rhs + corr
+    return phi_next
+
+
+# ============================================================
+# Adaptive controller (deterministic)
+# ============================================================
+
+class Controller:
+    """
+    Adaptive driver that adjusts dt to maintain monotone variance drop.
+    """
     def __init__(self,
-                 beta: float = 1.0,
-                 gamma: float = 0.5,
-                 clamp: float = 5.0,
-                 beta_bounds: tuple[float, float] = (0.5, 3.0),
-                 gamma_bounds: tuple[float, float] = (0.0, 1.5),
-                 clamp_bounds: tuple[float, float] = (1.0, 12.0),
-                 step: float = 0.05,
-                 ema: float = 0.90):
-        # Published control values
-        self.beta = float(beta)
-        self.gamma = float(gamma)
-        self.clamp = float(clamp)
+                 lambda_: float,
+                 D: float,
+                 phi_inf: float,
+                 spacing: Tuple[float, ...],
+                 bc: str = "neumann",
+                 safety: float = 0.8,
+                 growth: float = 1.1,
+                 shrink: float = 0.5):
+        self.lambda_ = lambda_
+        self.D = D
+        self.phi_inf = phi_inf
+        self.spacing = spacing
+        self.bc = bc
+        self.safety = safety
+        self.growth = growth
+        self.shrink = shrink
+        self.dt = safe_dt(lambda_, D, spacing, safety)
 
-        # Safety rails
-        self.beta_bounds = (float(beta_bounds[0]), float(beta_bounds[1]))
-        self.gamma_bounds = (float(gamma_bounds[0]), float(gamma_bounds[1]))
-        self.clamp_bounds = (float(clamp_bounds[0]), float(clamp_bounds[1]))
-
-        # Update dynamics
-        self.step = float(step)
-        self.ema = float(ema)
-
-        # Thresholds / hysteresis
-        self._kappa_expose = 0.80   # κ below → raise β
-        self._kappa_relax  = 0.95   # κ above (and safe) → lower β, loosen ⛔
-        self._p_half_safe  = 0.05   # near boundary → raise γ, tighten ⛔
-        self._p_half_tiny  = 0.01   # far from boundary → relax
-        self._grad_high    = 1.50   # large gradient → tighten ⛔
-
-        # EMA state
-        self._ema: Dict[str, float] = {}
-
-    # ──────────────────────────────────────────────────────────────────────
-    # PUBLIC API
-    # ──────────────────────────────────────────────────────────────────────
-
-    def update(self, telemetry: Mapping[str, float]) -> Dict[str, float]:
-        """
-        Read telemetry, update β, γ, and ⛔ with gentle, bounded steps.
-
-        Returns:
-            {'beta': β, 'gamma': γ, 'clamp': ⛔}  (all floats clipped to rails)
-        """
-        # 0) Parse tolerant telemetry; derive fallbacks when missing
-        kappa_raw, p_half_raw, grad_raw = self._read_telemetry(telemetry)
-
-        # 1) EMA smoothing
-        kappa = self._ema_update("kappa", kappa_raw)
-        p_half = self._ema_update("p_half", p_half_raw)
-        grad = self._ema_update("grad_norm", grad_raw)
-
-        # 2) Replace non-finite with safe defaults
-        kappa = self._finite_or(kappa, 1.0)
-        p_half = self._finite_or(p_half, 0.0)
-        grad = self._finite_or(grad, 0.0)
-
-        # 3) Control logic (small proportional nudges)
-        # γ: damping up when near barrier; down when clearly safe
-        if p_half > self._p_half_safe:
-            self.gamma += self.step
+    def evolve_once(self, phi: np.ndarray,
+                    variance_fn: Optional[callable] = None) -> Tuple[np.ndarray, float]:
+        """Perform one step and adapt dt if variance increases."""
+        phi_next = step(phi, self.lambda_, self.D, self.phi_inf, self.spacing, self.bc, self.dt)
+        if variance_fn is None:
+            v_ok = np.var(phi_next) <= np.var(phi) + 1e-9
         else:
-            self.gamma -= 0.5 * self.step
-
-        # β: increase if coherence is weak; gently decrease if very coherent & safe
-        if kappa < self._kappa_expose:
-            self.beta += 2.0 * self.step
-        elif kappa > self._kappa_relax and p_half < self._p_half_tiny:
-            self.beta -= self.step
-
-        # ⛔: tighten when near barrier or gradients high; loosen if very coherent & safe
-        if p_half > self._p_half_safe or grad > self._grad_high:
-            self.clamp -= 4.0 * self.step
-        elif kappa > self._kappa_relax and p_half < self._p_half_tiny:
-            self.clamp += 2.0 * self.step
-
-        # 4) Enforce rails
-        self.beta = self._clip(self.beta, *self.beta_bounds)
-        self.gamma = self._clip(self.gamma, *self.gamma_bounds)
-        self.clamp = self._clip(self.clamp, *self.clamp_bounds)
-
-        return {"beta": self.beta, "gamma": self.gamma, "clamp": self.clamp}
-
-    def apply(self, model) -> None:
-        """
-        Push current controls into a model that implements `.apply_control(beta, gamma, clamp)`.
-        Safe no-op if the method is absent.
-        """
-        if hasattr(model, "apply_control"):
-            model.apply_control(beta=self.beta, gamma=self.gamma, clamp=self.clamp)
-
-    def set_control(self,
-                    beta: Optional[float] = None,
-                    gamma: Optional[float] = None,
-                    clamp: Optional[float] = None) -> None:
-        """Manually override any of β, γ, ⛔ (values are clipped to rails)."""
-        if beta is not None:
-            self.beta = self._clip(float(beta), *self.beta_bounds)
-        if gamma is not None:
-            self.gamma = self._clip(float(gamma), *self.gamma_bounds)
-        if clamp is not None:
-            self.clamp = self._clip(float(clamp), *self.clamp_bounds)
-
-    def reset(self,
-              beta: float = 1.0,
-              gamma: float = 0.5,
-              clamp: float = 5.0) -> None:
-        """Reset controls to defaults and clear EMA memory."""
-        self.beta = self._clip(float(beta), *self.beta_bounds)
-        self.gamma = self._clip(float(gamma), *self.gamma_bounds)
-        self.clamp = self._clip(float(clamp), *self.clamp_bounds)
-        self._ema.clear()
-
-    def state(self) -> Dict[str, float]:
-        """Snapshot of current controls (for logs/dashboards)."""
-        return {"beta": self.beta, "gamma": self.gamma, "clamp": self.clamp}
-
-    # ──────────────────────────────────────────────────────────────────────
-    # INTERNALS
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _read_telemetry(self, tele: Mapping[str, float]) -> tuple[float, float, float]:
-        """
-        Parse tolerant telemetry and derive (κ, p½, grad_norm).
-
-        Accepts:
-            κ: tele['kappa'] or tele['κ']  (fallback from p½ if needed)
-            p½: tele['p_half'] or tele['p½']  (fallback from x_mean & δ⋆)
-            grad_norm: tele['grad_norm']  (default 0.0 if missing)
-            optional: 'x_mean' + 'delta'/'δ⋆' to derive p½
-        """
-        # Primary reads (tolerant keys)
-        kappa = tele.get("kappa", tele.get("κ"))
-        p_half = tele.get("p_half", tele.get("p½"))
-        grad = tele.get("grad_norm", 0.0)
-
-        # Derive p½ from x_mean and δ⋆ if missing
-        if p_half is None:
-            x = tele.get("x_mean")
-            delta = tele.get("delta", tele.get("δ⋆"))
-            if (x is not None) and (delta is not None):
-                try:
-                    d = float(delta)
-                    if d > 0.0 and math.isfinite(d):
-                        k = math.floor((float(x) / d) + 0.5)
-                        r = float(x) - k * d
-                        # Normalize to proportion of half-click (≥0)
-                        p_half = min(1.0, abs(r) / (0.5 * d))
-                except Exception:
-                    p_half = None
-
-        # Derive κ from p½ if missing (simple complement)
-        if kappa is None and p_half is not None:
-            try:
-                kappa = 1.0 - float(p_half)
-            except Exception:
-                kappa = None
-
-        # Safe defaults
-        kappa = float(kappa) if (kappa is not None and math.isfinite(float(kappa))) else 1.0
-        p_half = float(p_half) if (p_half is not None and math.isfinite(float(p_half))) else 0.0
-        grad = float(grad) if math.isfinite(float(grad)) else 0.0
-
-        return kappa, p_half, grad
-
-    def _ema_update(self, key: str, value: float) -> float:
-        """Exponential moving average: y_t = α·y_{t−1} + (1−α)·x_t."""
-        v = float(value)
-        if key not in self._ema:
-            self._ema[key] = v
+            v_ok = variance_fn(phi, phi_next)
+        if v_ok:
+            self.dt *= self.growth
         else:
-            a = self.ema
-            self._ema[key] = a * self._ema[key] + (1.0 - a) * v
-        return self._ema[key]
+            self.dt *= self.shrink
+        self.dt = min(self.dt, safe_dt(self.lambda_, self.D, self.spacing, self.safety))
+        return phi_next, self.dt
 
-    @staticmethod
-    def _clip(v: float, lo: float, hi: float) -> float:
-        """Clamp v into [lo, hi]."""
-        return max(lo, min(hi, v))
 
-    @staticmethod
-    def _finite_or(v: float, default: float) -> float:
-        """Return v if finite; otherwise default."""
-        try:
-            return v if math.isfinite(float(v)) else float(default)
-        except Exception:
-            return float(default)
+# ============================================================
+# Exports
+# ============================================================
+
+__all__ = [
+    "safe_dt",
+    "step", "step_torch", "step_semi_implicit",
+    "Controller"
+]
