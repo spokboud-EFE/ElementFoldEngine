@@ -40,14 +40,25 @@ HTML = """<!DOCTYPE html>
   <div id="tele" class="tele"></div>
 
   <script>
+    let autoTimer = null;
+    let lastStopped = null;
+
     async function startLoop(){
       await fetch('/brain/loop/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
       setTimeout(fetchStatus,1000);
+      if(!autoTimer){ autoTimer = setInterval(fetchStatus,3000); }
+      lastStopped = null;
+      updateFooter();
     }
+
     async function stopLoop(){
       await fetch('/brain/loop/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
       setTimeout(fetchStatus,500);
+      if(autoTimer){ clearInterval(autoTimer); autoTimer = null; }
+      lastStopped = new Date();
+      updateFooter();
     }
+
     async function fetchStatus(){
       try {
         const res = await fetch('/brain/loop/status');
@@ -91,8 +102,27 @@ HTML = """<!DOCTYPE html>
         <span class='mono'>δ⋆=${(t.delta||0).toFixed(6)}</span></p>`;
     }
 
+    function updateFooter(){
+      let f = document.getElementById('footer');
+      if(!f){
+        f = document.createElement('div');
+        f.id = 'footer';
+        f.className = 'mono';
+        f.style.marginTop = '1rem';
+        document.body.appendChild(f);
+      }
+      if(lastStopped){
+        const hh = lastStopped.getHours().toString().padStart(2,"0");
+        const mm = lastStopped.getMinutes().toString().padStart(2,"0");
+        const ss = lastStopped.getSeconds().toString().padStart(2,"0");
+        f.innerText = `Loop stopped at ${hh}:${mm}:${ss}`;
+      } else {
+        f.innerText = "";
+      }
+    }
+
     fetchStatus();
-    setInterval(fetchStatus, 3000);
+    autoTimer = setInterval(fetchStatus, 3000);
   </script>
 </body>
 </html>

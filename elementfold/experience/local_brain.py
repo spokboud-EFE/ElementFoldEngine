@@ -74,20 +74,102 @@ class LocalBrain:
     # --------------------------------------------------------
 
     def _observe(self) -> Dict[str, Any]:
+        """
+        Try to pull a 'snapshot' of the relaxation state:
+        • If engine has a field state with phi (array-like) and maybe t → compute basic telemetry.
+        • Read background params (lambda, D, phi_inf) from eng.background or eng.
+        • Be defensive: if we cannot find a phi, report an empty telemetry shell.
+        """
+        tele: Dict[str, Any] = {}
+        cfg: Dict[str, Any] = {}
         try:
-            # Ask runtime for last state telemetry
-            tele = self.engine.telemetry(self.engine.background) if hasattr(self.engine, "telemetry") else {}
+            eng = self.engine
+
+            # 1) find a candidate state that has 'phi' (array-like)
+            cand = None
+
+            # (a) attributes that are already objects/dicts
+            for name in ("last_state", "field"):
+                obj = getattr(eng, name, None)
+                if obj is not None:
+                    cand = obj
+                    break
+
+            # (b) callables returning a state snapshot
+            if cand is None:
+                for name in ("state", "snapshot", "get_state", "get_field"):
+                    fn = getattr(eng, name, None)
+                    if callable(fn):
+                        try:
+                            cand = fn()
+                            break
+                        except Exception:
+                            cand = None
+
+            # (c) final fallback: eng.phi directly
+            # (Note: this should be an array, not BackgroundParams)
+            phi = None
+            t = None
+
+            def _extract_phi_t(x):
+                # Try dict-like
+                if isinstance(x, dict):
+                    return x.get("phi", None), x.get("t", None)
+                # Try object attributes
+                return getattr(x, "phi", None), getattr(x, "t", None)
+
+            if cand is not None:
+                phi, t = _extract_phi_t(cand)
+
+                # Some projects wrap the field under a 'state' sub-object
+                if phi is None:
+                    sub = getattr(cand, "state", None)
+                    if sub is not None:
+                        phi, t = _extract_phi_t(sub)
+
+            if phi is None:
+                # last fallback: direct attribute on engine (NOT the background params)
+                phi = getattr(eng, "phi", None)
+                t = getattr(eng, "t", None)
+
+            # 2) compute light telemetry if we found a phi array
+            if phi is not None:
+                try:
+                    import numpy as np
+                    arr = phi
+                    # Support torch tensor or numpy; convert to numpy
+                    if hasattr(arr, "detach"):
+                        arr = arr.detach()
+                    if hasattr(arr, "cpu"):
+                        arr = arr.cpu()
+                    if hasattr(arr, "numpy"):
+                        arr = arr.numpy()
+                    arr = np.asarray(arr)
+                    tele["variance"] = float(np.var(arr))
+                    tele["mean"] = float(np.mean(arr))
+                    if t is not None:
+                        tele["t"] = float(t)
+                except Exception:
+                    # If conversion fails, report placeholders
+                    tele.setdefault("variance", None)
+                    tele.setdefault("mean", None)
+            else:
+                # No field available; keep telemetry empty but valid
+                tele.setdefault("variance", None)
+                tele.setdefault("mean", None)
+
+            # 3) background parameters (lambda, D, phi_inf, dt)
+            b = getattr(eng, "background", None)
+            cfg["lambda"] = getattr(b, "lambda_", getattr(eng, "lambda_", None))
+            cfg["D"] = getattr(b, "D", getattr(eng, "D", None))
+            cfg["phi_inf"] = getattr(b, "phi_inf", getattr(eng, "phi_inf", None))
+            cfg["dt"] = getattr(eng, "dt", None)
+
         except Exception as e:
+            # one-line warning; keep the loop resilient
             warn(f"Telemetry read failed: {e}")
-            tele = {}
-        cfg = getattr(self.engine, "background", None)
-        config = {
-            "lambda": getattr(cfg, "lambda_", None),
-            "D": getattr(cfg, "D", None),
-            "phi_inf": getattr(cfg, "phi_inf", None),
-            "dt": getattr(self.engine, "dt", None),
-        }
-        return {"telemetry": tele, "config": config}
+        return {"telemetry": tele, "config": cfg}
+
 
     # --------------------------------------------------------
     # Reasoning: ask the model

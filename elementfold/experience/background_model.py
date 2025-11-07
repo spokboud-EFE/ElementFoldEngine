@@ -39,6 +39,7 @@ Message = Dict[str, str]
 Messages = List[Message]
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Small data records
 # ──────────────────────────────────────────────────────────────────────────────
@@ -640,6 +641,21 @@ class BackgroundModel:
                     self._h_local.last_error = self._h_local.last_error or err
                     if self._h_remote:
                         self._h_remote.last_error = self._h_remote.last_error or err
+    # ──────────────────────────────────────────────────────────────────────────────
+    # Compatibility shim for LocalBrain
+    # ──────────────────────────────────────────────────────────────────────────────
+
+    def _chat(self, messages: Messages, **kw) -> Completion:
+        """
+        Wrapper so LocalBrain can call BackgroundModel.chat(messages=[...]).
+        Simply forwards to .generate() and returns a Completion object.
+        """
+        return self.generate(messages, **kw)
+
+    # attach only if missing
+    if not hasattr(BackgroundModel, "chat"):
+        BackgroundModel.chat = _chat  # type: ignore
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
