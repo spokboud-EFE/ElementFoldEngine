@@ -1,191 +1,153 @@
-# ElementFold · export.py
-# Portable exporters + checkpoints with clear, non‑expert narration.
-# Read this like a toolbox:
-#   • save_checkpoint / load_checkpoint  — robust weight I/O with config + metadata
-#   • export_torchscript                — trace/script a model to a self‑contained .pt
-#   • export_onnx                       — ONNX graph export with friendly names/axes
+# ElementFold · helpers/export.py
+# ============================================================
+# Portable state and parameter exporters for relaxation runs
+# ------------------------------------------------------------
+# Responsibilities
+#   • dump_state / load_state        – Φ arrays + metadata to .json / .npy
+#   • dump_params / load_params      – background + optics to .json
+#   • save_bundle / load_bundle      – combined archive (.npz)
+#
+# All functions are NumPy / JSON only (no torch dependency).
+# ============================================================
 
-from __future__ import annotations                       # ↻ forward annotations on older Python
-import os, json, time                                    # ✴ filesystem • JSON • timestamp
-from typing import Any, Dict, Tuple, Optional            # ✴ light typing
-import torch                                             # ✴ tensors • JIT • ONNX hooks
+from __future__ import annotations
+import os, json, time
+import numpy as np
+from typing import Any, Dict
 
-
-# ———————————————————————————————————————————————————————————————
-# Tiny FS helper
-# ———————————————————————————————————————————————————————————————
-
-def _ensure_dir(path: str) -> None:                      # ✴ make parent folder if needed
-    folder = os.path.dirname(path) or "."
-    os.makedirs(folder, exist_ok=True)
+from ..core.data import FieldState, BackgroundParams, OpticalParams
 
 
-# ———————————————————————————————————————————————————————————————
-# Checkpoint I/O (portable, self‑describing)
-# ———————————————————————————————————————————————————————————————
+# ============================================================
+# Helpers
+# ============================================================
 
-def save_checkpoint(model: torch.nn.Module, path: str, cfg: Any | None = None, extra: Dict[str, Any] | None = None) -> str:
+def _ensure_dir(path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+
+def _timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ============================================================
+# Field state I/O
+# ============================================================
+
+def dump_state(state: FieldState, path: str) -> str:
     """
-    Save a model state_dict plus optional config/metadata in one file.
-    We move tensors to CPU for portability so the file loads anywhere.
+    Save Φ, spacing, bc, and t to a portable JSON + NPY pair.
     """
-    _ensure_dir(path)                                    # 📁 ensure folder exists
-    mod = model.module if hasattr(model, "module") else model  # ✴ unwrap DDP if present
-    state = {k: v.detach().cpu() for k, v in mod.state_dict().items()}  # 🧱 CPU weights
+    _ensure_dir(path)
+    base, _ = os.path.splitext(path)
+    npy_path = base + ".npy"
+    meta_path = base + ".json"
 
-    # Convert config to a plain dict if it’s a dataclass/object with to_dict()
-    if cfg is None:
-        cfg_payload = None
-    elif hasattr(cfg, "to_dict"):
-        cfg_payload = cfg.to_dict()                      # dataclass → dict
-    elif isinstance(cfg, dict):
-        cfg_payload = cfg                                # already a dict
-    else:
-        # Best effort: JSON‑serialize arbitrary config objects
-        try:
-            cfg_payload = json.loads(json.dumps(cfg, default=lambda o: getattr(o, "__dict__", str(o))))
-        except Exception:
-            cfg_payload = {"repr": repr(cfg)}            # last‑resort repr
+    np.save(npy_path, state.phi.astype(np.float32))
 
-    payload = {                                          # 🗂 self‑describing bundle
-        "format": "elementfold.ckpt.v1",                 # format tag for forwards‑compat
-        "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),  # ISO‑like timestamp
-        "torch": torch.__version__,                      # environment hint
-        "state_dict": state,                             # weights (CPU)
-        "config": cfg_payload,                           # optional config snapshot
-        "extra": dict(extra or {}),                      # freeform metadata
+    meta = {
+        "format": "elementfold.state.v1",
+        "time_utc": _timestamp(),
+        "shape": list(state.phi.shape),
+        "spacing": list(state.spacing),
+        "bc": state.bc,
+        "t": float(state.t),
     }
-    torch.save(payload, path)                            # 💾 write atomically
-    return path                                          # ↤ for convenience in call chains
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    return base
 
 
-def load_checkpoint(path: str, model_ctor, map_location: str | torch.device = "cpu", strict: bool = True
-                   ) -> Tuple[torch.nn.Module, Any | None, Dict[str, Any]]:
+def load_state(base_path: str) -> FieldState:
     """
-    Load a checkpoint into a fresh model instance.
-
-    Args:
-      path:          file produced by save_checkpoint()
-      model_ctor:    zero‑arg callable that returns a *fresh* model instance
-      map_location:  where tensors land on load (e.g., 'cpu' or 'cuda')
-      strict:        whether to enforce an exact key‑by‑key match
-
-    Returns:
-      (model, config, info) where info carries missing/unexpected keys.
+    Load a FieldState from a JSON + NPY pair written by dump_state().
     """
-    chk = torch.load(path, map_location=map_location)    # 📖 read file (portable)
-    model = model_ctor()                                 # 🏗️ fresh model
-    result = model.load_state_dict(chk["state_dict"], strict=strict)  # ⟲ load weights
+    base, _ = os.path.splitext(base_path)
+    npy_path = base + ".npy"
+    meta_path = base + ".json"
+    phi = np.load(npy_path)
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    return FieldState(
+        phi=np.array(phi, dtype=float),
+        t=float(meta.get("t", 0.0)),
+        spacing=tuple(meta.get("spacing", [1.0] * phi.ndim)),
+        bc=meta.get("bc", "neumann"),
+    )
 
-    # Normalize “incompatible keys” into plain lists for easy logging
-    missing, unexpected = [], []
-    try:
-        missing = list(getattr(result, "missing_keys", []))
-        unexpected = list(getattr(result, "unexpected_keys", []))
-    except Exception:
-        pass
 
-    info = {                                             # 🧾 small report for the caller
-        "format": chk.get("format", "unknown"),
-        "torch": chk.get("torch", "unknown"),
-        "missing_keys": missing,
-        "unexpected_keys": unexpected,
-        "extra": chk.get("extra", {}),
+# ============================================================
+# Parameter I/O
+# ============================================================
+
+def dump_params(background: BackgroundParams,
+                optics: OpticalParams,
+                path: str) -> str:
+    """
+    Save background and optical parameter sets as JSON.
+    """
+    _ensure_dir(path)
+    payload = {
+        "format": "elementfold.params.v1",
+        "time_utc": _timestamp(),
+        "background": background.as_dict(),
+        "optics": optics.as_dict(),
     }
-    return model, chk.get("config", None), info          # ↤ model + config snapshot + report
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return path
 
 
-# ———————————————————————————————————————————————————————————————
-# TorchScript export (trace/script, optimize if available)
-# ———————————————————————————————————————————————————————————————
-
-def export_torchscript(model: torch.nn.Module, example_inputs, path: str,
-                       method: str = "trace", optimize: bool = True) -> torch.jit.ScriptModule:
+def load_params(path: str) -> Dict[str, Any]:
     """
-    Turn a PyTorch module into a self‑contained TorchScript file (.pt).
-
-    Args:
-      model:          nn.Module in eval mode (we’ll call .eval() for safety)
-      example_inputs: tensor or tuple/list of tensors used for tracing
-      path:           output file (.pt)
-      method:         'trace' (default) or 'script'
-      optimize:       try torch.jit.optimize_for_inference to remove dead graph parts
-
-    Returns:
-      The in‑memory ScriptModule that was saved.
+    Load background/optics parameters from JSON.
+    Returns {'background': BackgroundParams, 'optics': OpticalParams}.
     """
-    _ensure_dir(path)                                    # 📁 ensure folder
-    mod = model.module if hasattr(model, "module") else model
-    mod.eval()                                           # 🚦 inference graph
-    cpu = mod.to("cpu")                                  # 🌍 portable capture
-    with torch.no_grad():                                # ≡ no grads in export
-        if method == "script":
-            ts = torch.jit.script(cpu)                   # ✴ compile by scripting
-        else:
-            # Pack single tensor into a tuple for torch.jit.trace when needed.
-            ex = example_inputs
-            if not isinstance(ex, (tuple, list)):
-                ex = (ex,)
-            ts = torch.jit.trace(cpu, ex, strict=False)  # ✴ compile by tracing
-        # Optional graph optimization (available on most builds)
-        if optimize:
-            try:
-                from torch.jit import optimize_for_inference as _opt
-                ts = _opt(ts)
-            except Exception:
-                pass                                     # silently skip if unsupported
-        ts.save(path)                                    # 💾 write TorchScript
-        return ts                                        # ↤ return compiled module
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    bg = BackgroundParams(**payload["background"])
+    op = OpticalParams(**payload["optics"])
+    return {"background": bg, "optics": op}
 
 
-# ———————————————————————————————————————————————————————————————
-# ONNX export (friendly names + dynamic axes)
-# ———————————————————————————————————————————————————————————————
+# ============================================================
+# Combined bundle (for quick checkpoints)
+# ============================================================
 
-def export_onnx(model: torch.nn.Module, example_inputs, path: str,
-                opset: int = 17, dynamic: bool = True) -> str:
+def save_bundle(state: FieldState,
+                background: BackgroundParams,
+                optics: OpticalParams,
+                path: str) -> str:
     """
-    Export a model to ONNX with two named outputs:
-        'logits' (B,T,V) and 'ledger' (B,T)
-
-    Args:
-      model:          nn.Module in eval mode (we’ll call .eval() and move to CPU)
-      example_inputs: input tensor(s) — shape should match real inference
-      path:           destination .onnx path
-      opset:          ONNX opset version (17 is a safe modern default)
-      dynamic:        add dynamic axes for batch/time so it runs on variable lengths
-
-    Returns:
-      Path to the saved .onnx file.
+    Store Φ and parameters together in one .npz archive.
     """
-    _ensure_dir(path)                                    # 📁 ensure folder
-    mod = model.module if hasattr(model, "module") else model
-    mod.eval().to("cpu")                                 # 🚦 inference on CPU
-    # Normalize example inputs to a tuple
-    ex = example_inputs if isinstance(example_inputs, (tuple, list)) else (example_inputs,)
+    _ensure_dir(path)
+    np.savez_compressed(
+        path,
+        phi=state.phi.astype(np.float32),
+        t=state.t,
+        spacing=np.array(state.spacing, dtype=np.float32),
+        bc=np.string_(state.bc),
+        lambda_=background.lambda_,
+        D=background.D,
+        phi_inf=background.phi_inf,
+        nu0=optics.nu0,
+    )
+    return path
 
-    # Names for readability and easier wiring in downstream runtimes
-    in_names = [f"input{i}" for i in range(len(ex))]     # e.g., ['input0']
-    out_names = ["logits", "ledger"]                     # matches (logits, X) from our model
 
-    # Dynamic axes mapping so ONNX runtimes accept varying batch/time
-    dyn = None
-    if dynamic:
-        dyn = {name: {0: "batch"} for name in in_names}  # batch axis on all inputs
-        # Assume input0 is (B,T); propagate dynamic time to outputs
-        dyn[in_names[0]][1] = "time"
-        dyn["logits"] = {0: "batch", 1: "time"}          # (B,T,V)
-        dyn["ledger"] = {0: "batch", 1: "time"}          # (B,T)
-
-    with torch.no_grad():                                # ≡ export is pure forward
-        torch.onnx.export(
-            mod,                                         # model
-            ex,                                          # example inputs
-            path,                                        # file path
-            input_names=in_names,                        # friendly names
-            output_names=out_names,                      # friendly names
-            dynamic_axes=dyn,                            # allow variable batch/time
-            opset_version=int(opset),                    # ONNX dialect
-            do_constant_folding=True,                    # fold statics where safe
-        )
-    return path                                          # ↤ for call‑chain convenience
+def load_bundle(path: str) -> Dict[str, Any]:
+    """
+    Read a .npz bundle back into state + params.
+    """
+    data = np.load(path, allow_pickle=False)
+    phi = data["phi"]
+    t = float(data["t"])
+    spacing = tuple(data["spacing"].tolist())
+    bc = str(data["bc"].tolist().decode("utf-8")) if isinstance(data["bc"], np.ndarray) else "neumann"
+    bg = BackgroundParams(float(data["lambda_"]), float(data["D"]), float(data["phi_inf"]))
+    # Optics reconstructed minimally (functional forms supplied elsewhere)
+    from ..core.data import default_optics
+    op = default_optics()
+    op.nu0 = float(data.get("nu0", 1.0))
+    return {"state": FieldState(phi, t, spacing, bc), "background": bg, "optics": op}
