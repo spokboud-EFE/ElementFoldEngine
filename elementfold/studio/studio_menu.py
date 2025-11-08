@@ -89,7 +89,11 @@ class StudioMenu:
         """Stop panels and shutdown studio cleanly."""
         self._stop_panels()
         self.studio.shutdown()
-        print(_info("👋 StudioMenu exited."))
+        import sys
+        print("\033[2m[studio] ✨ system cooled and exited\033[0m")
+        sys.stdout.flush()
+        sys.exit(0)
+
 
     # ------------------------------------------------------------------ #
     # Panels
