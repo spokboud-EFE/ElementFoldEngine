@@ -12,6 +12,9 @@ TelemetryBus  → main event bus (publish/subscribe, non-blocking)
 TelemetryMessage → structured telemetry record
 """
 
-from .bus import TelemetryBus, TelemetryMessage
+# elementfold/core/telemetry/__init__.py
+from .bus import TelemetryBus
+from .metrics import TelemetryEvent, make_event, validate_event, normalize_event
+
 
 __all__ = ["TelemetryBus", "TelemetryMessage"]

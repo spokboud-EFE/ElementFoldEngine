@@ -59,7 +59,7 @@ class FactoryMonitor:
         self._stop_flag = threading.Event()
 
         # subscribe immediately
-        self.bus.subscribe(self._on_event)
+        self.bus.subscribe(f"factory_monitor_{id(self)}", self._on_event)
 
         # internal buffers
         self._last_event: str = ""

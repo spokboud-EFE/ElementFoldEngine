@@ -1,194 +1,177 @@
 """
-core/control/factory.py — The Conductor 🏭 of ElementFold
-
+core/control/factory.py — Device-Aware Factory 🏭
 ──────────────────────────────────────────────────────────────────────
-──────────────────────────────────────────────────────────────────────
-• The Factory builds, synchronizes, and entangles multiple cores.
-• Each core is a Runtime wrapped with its own Ledger and coupled
-  through shared Synchronizer (δ★) and Coupler (ρ, κ).
-• The TelemetryBus carries their voices; the Studio listens in.
+Purpose
+  • Manage cores and devices in a single Studio session.
+  • Never run unless a device is attached.
+  • Clean, idempotent start/stop, safe for headless sessions.
 ──────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
-
 import time
+import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, Optional, List
 
-from .runtime import Runtime
-from .ledger import Ledger
-from .synchronizer import Synchronizer
-from .coupler import Coupler
-from ..telemetry import TelemetryBus
+from elementfold.core.control.runtime import Runtime
+from elementfold.core.control.ledger import Ledger
+from elementfold.core.control.synchronizer import Synchronizer
+from elementfold.core.control.coupler import Coupler
+from elementfold.core.telemetry.bus import TelemetryBus
+from elementfold.core.physics.safety_guard import SafetyGuard
 
 
-# ====================================================================== #
-# 🧩 CoreInstance — a single living core built by the Factory
-# ====================================================================== #
 @dataclass
-class CoreInstance:
-    """Encapsulates a Runtime, its Ledger, and connection metadata."""
-
+class CoreWrapper:
+    """A minimal container tying together runtime, ledger, and optional driver."""
     name: str
     runtime: Runtime
     ledger: Ledger
-    synchronizer: Synchronizer
-    mode: str = "shaping"
-
-    def tick(self, dt: float) -> None:
-        """Advance one δ★ tick with safety guards."""
-        try:
-            self.runtime.step(dt)
-            self.synchronizer.align(self.runtime)
-            self.ledger.record_step(self.runtime, dt)
-        except (ArithmeticError, ValueError) as exc:
-            print(f"[{self.name}] ⚠️ numerical instability: {exc}")
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            print(f"[{self.name}] 💥 runtime exception: {exc}")
-            self.runtime.stop()
+    driver: Optional[Any] = None
 
 
 # ====================================================================== #
-# 🏭 Factory — orchestrates, synchronizes, and couples cores
+# 🏭 Factory
 # ====================================================================== #
 @dataclass
 class Factory:
-    """Central conductor managing all active cores."""
+    """Central orchestrator for all cores and devices."""
 
     telemetry: TelemetryBus = field(default_factory=TelemetryBus)
+    guard: SafetyGuard = field(default_factory=SafetyGuard)
     synchronizer: Synchronizer = field(default_factory=Synchronizer)
     coupler: Coupler = field(default_factory=Coupler)
-    cores: Dict[str, CoreInstance] = field(default_factory=dict)
-    tick_interval: float = 0.01  # default Δt between steps
-    running: bool = False
+
+    cores: Dict[str, CoreWrapper] = field(default_factory=dict)
+    devices: Dict[str, Any] = field(default_factory=dict)
+    _running: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ------------------------------------------------------------------ #
-    # 🧱 Construction
+    # ⚙️  Core management
     # ------------------------------------------------------------------ #
-    def register_core(
-        self,
-        name: str,
-        runtime: Runtime,
-        ledger: Optional[Ledger] = None,
-    ) -> None:
-        """Attach a Runtime to the Factory with its own Ledger."""
+    def register_core(self, name: str, runtime: Optional[Runtime] = None) -> None:
+        """Register a new core (without auto-starting it)."""
         if name in self.cores:
-            raise ValueError(f"Core '{name}' already registered.")
-
-        ledger = ledger or Ledger(name=name, telemetry=self.telemetry)
-        self.cores[name] = CoreInstance(
-            name=name,
-            runtime=runtime,
-            ledger=ledger,
-            synchronizer=self.synchronizer,
-        )
-        self.telemetry.emit("🏗️ core.registered", core=name)
-        self.telemetry.emit("📖 ledger.attached", core=name, entries=len(ledger))
-
-    # ------------------------------------------------------------------ #
-    # ▶️ Lifecycle control
-    # ------------------------------------------------------------------ #
-    def start(self) -> None:
-        """Start global loop — begins ticking all cores."""
-        if self.running:
+            print(f"[factory] core '{name}' already exists.")
             return
-        self.running = True
-        self.telemetry.emit("🏭 factory.start", cores=len(self.cores))
+        self.cores[name] = CoreWrapper(name=name, runtime=runtime or Runtime(), ledger=Ledger())
+        self.telemetry.publish("🏗️ core.registered", {"core": name})
+        print(f"[factory] core '{name}' registered.")
+
+    def attach_device(self, core_name: str, driver: Any) -> None:
+        """Attach a driver or dataset to a core."""
+        if core_name not in self.cores:
+            raise ValueError(f"[factory] unknown core '{core_name}'")
+        core = self.cores[core_name]
+        core.driver = driver
+        self.devices[core_name] = driver
+        print(f"[factory] device attached to core '{core_name}'.")
+        self.telemetry.publish("🔌 device.attached", {"core": core_name})
+
+    def detach_device(self, core_name: str) -> None:
+        """Detach driver and stop the core."""
+        core = self.cores.get(core_name)
+        if not core:
+            return
+        core.driver = None
+        self.devices.pop(core_name, None)
+        self.telemetry.publish("🧲 device.detached", {"core": core_name})
+        print(f"[factory] device detached from '{core_name}'.")
+
+    # ------------------------------------------------------------------ #
+    # 🕓  Device awareness
+    # ------------------------------------------------------------------ #
+    def has_device(self) -> bool:
+        """Return True if at least one device is attached."""
+        return bool(self.devices)
+
+    # ------------------------------------------------------------------ #
+    # ▶️  Start / Stop
+    # ------------------------------------------------------------------ #
+    def start(self, device: Optional[Any] = None) -> None:
+        """
+        Start the factory only if a device is attached or provided.
+        Idempotent and thread-safe.
+        """
+        with self._lock:
+            if self._running:
+                print("[factory] already running.")
+                return
+            if not (device or self.has_device()):
+                print("[factory] no device attached — idle mode.")
+                self._running = False
+                return
+
+            # attach provided device if core empty
+            if device and isinstance(device, dict):
+                for name, drv in device.items():
+                    self.attach_device(name, drv)
+
+            self._running = True
+            self.telemetry.publish("🏭 factory.start", {"cores": len(self.cores)})
+            print(f"[factory] started with {len(self.devices)} active device(s).")
 
     def stop(self) -> None:
-        """Stop all runtimes and mark factory as halted."""
-        if not self.running:
-            return
-        self.running = False
-        self.telemetry.emit("⛔ factory.stop")
-        for c in self.cores.values():
-            c.runtime.stop()
+        """Stop all active cores, close ledgers, clear telemetry."""
+        with self._lock:
+            if not self._running:
+                print("[factory] stop() called — already idle.")
+                return
+            for name, core in self.cores.items():
+                try:
+                    core.ledger.close()
+                except Exception:
+                    pass
+            self.telemetry.publish("⛔ factory.stop", {})
+            self.telemetry.close()
+            self.devices.clear()
+            self._running = False
+            print("[factory] stopped and cleared all devices.")
 
     # ------------------------------------------------------------------ #
-    # 🔁 Synchronization & Entanglement
+    # 📸  Snapshot for panels
     # ------------------------------------------------------------------ #
-    def synchronize(self) -> None:
-        """Align δ★ and phase across all cores."""
-        self.synchronizer.synchronize(list(self.cores.values()))
-        self.telemetry.emit("🕰️ delta.star.sync", cores=len(self.cores))
-
-    def entangle(self) -> None:
-        """Apply coupling (ρ, κ) across all cores."""
-        self.coupler.couple(list(self.cores.values()))
-        self.telemetry.emit("🕸️ entanglement.updated", rho=self.coupler.rho, kappa=self.coupler.kappa)
-
-    # ------------------------------------------------------------------ #
-    # 🫀 Main step loop
-    # ------------------------------------------------------------------ #
-    def step_all(self, dt: Optional[float] = None) -> None:
-        """Advance all registered cores by one δ★ tick."""
-        step_dt = dt if dt is not None else self.tick_interval
-        for core in self.cores.values():
-            core.tick(step_dt)
-        self.synchronize()
-        self.entangle()
-
-    def run(
-        self,
-        *,
-        steps: Optional[int] = None,
-        duration: Optional[float] = None,
-        dt: Optional[float] = None,
-    ) -> None:
-        """
-        Continuous orchestration loop.
-        - steps : number of δ★ ticks to perform
-        - duration : wall-clock seconds to run
-        - dt : step size override
-        """
-        if not self.cores:
-            self.telemetry.emit("⚠️ factory.empty")
-            return
-
-        self.start()
-        start = time.perf_counter()
-        n = 0
-        while self.running:
-            if steps is not None and n >= steps:
-                break
-            if duration is not None and (time.perf_counter() - start) >= duration:
-                break
-            self.step_all(dt)
-            n += 1
-        self.stop()
-        self.telemetry.emit("🏁 factory.run.complete", steps=n)
+    def snapshot(self) -> Dict[str, Any]:
+        """Return current runtime summaries for all cores."""
+        data: Dict[str, Any] = {}
+        for name, core in self.cores.items():
+            rt = core.runtime
+            data[name] = {
+                "t": getattr(rt, "t", 0.0),
+                "mode": getattr(rt, "mode", "idle"),
+                "kappa": getattr(rt.state, "kappa", 1.0) if hasattr(rt, "state") else 1.0,
+                "params": getattr(rt, "params", {}),
+            }
+        self.telemetry.publish("📸 factory.snapshot", {"cores": len(data)})
+        return data
 
     # ------------------------------------------------------------------ #
-    # 📸 Diagnostics
-    # ------------------------------------------------------------------ #
-    def snapshot(self) -> Dict[str, Dict]:
-        """Collect current state of all cores (for Studio display)."""
-        snap = {name: c.runtime.snapshot() for name, c in self.cores.items()}
-        self.telemetry.emit("📸 factory.snapshot", cores=len(snap))
-        return snap
-
-    def summary(self) -> str:
-        """Return short textual summary for debugging."""
-        lines: List[str] = []
-        for name, c in self.cores.items():
-            entry = c.ledger.latest()
-            if entry:
-                lines.append(f"{name}: t={entry.t:.3f} κ={entry.kappa:.2f} {entry.notes}")
-            else:
-                lines.append(f"{name}: (no ledger yet)")
-        return "\n".join(lines)
-
-    # ------------------------------------------------------------------ #
-    # 🧹 Maintenance
+    # 🧹  Maintenance
     # ------------------------------------------------------------------ #
     def clear_ledgers(self) -> None:
-        """Erase all core ledgers."""
-        for c in self.cores.values():
-            c.ledger.clear()
-        self.telemetry.emit("🧹 ledgers.cleared", cores=len(self.cores))
+        """Clear all ledger entries from disk (non-blocking)."""
+        for name, core in self.cores.items():
+            try:
+                core.ledger.clear()
+            except Exception:
+                pass
+        self.telemetry.publish("🧹 ledgers.cleared", {"cores": len(self.cores)})
+        print("[factory] ledgers cleared.")
+
+    # ------------------------------------------------------------------ #
+    # 🧠  Diagnostics
+    # ------------------------------------------------------------------ #
+    def status(self) -> Dict[str, Any]:
+        """Return concise status summary."""
+        return {
+            "running": self._running,
+            "cores": len(self.cores),
+            "devices": len(self.devices),
+            "has_device": self.has_device(),
+        }
 
     def __repr__(self) -> str:
-        return f"<Factory cores={len(self.cores)} running={self.running}>"
+        state = "running" if self._running else "idle"
+        return f"<Factory cores={len(self.cores)} devices={len(self.devices)} state={state}>"

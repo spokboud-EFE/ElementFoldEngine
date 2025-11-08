@@ -1,175 +1,150 @@
 """
-core/telemetry/bus.py — The Voice 📡 of ElementFold
-
+core/telemetry/bus.py — Non-blocking Telemetry Bus 📡
 ──────────────────────────────────────────────────────────────────────
+Purpose
+  • Publish/subscribe system for all ElementFold components.
+  • Non-blocking: publishers never hang.
+  • Safe subscribe/unsubscribe even after close().
+  • Graceful shutdown via close(); drains & clears queues.
+  • Works in idle mode (no background churn).
 ──────────────────────────────────────────────────────────────────────
-• The Bus carries every heartbeat message through the system.
-• It whispers to Studio dashboards, writes to logs, and mirrors to recorders.
-• Nothing blocks: telemetry is soft real-time — never stops physics.
-• Each message can be spoken, stored, or silently observed.
 """
 
 from __future__ import annotations
-
-import json
-import sys
+import queue
+import threading
 import time
-from dataclasses import dataclass
-from threading import RLock
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
 
 # ====================================================================== #
-# 📨 TelemetryMessage — atomic unit of the Bus
+# 🧩 TelemetryBus
 # ====================================================================== #
 @dataclass
-class TelemetryMessage:
-    """Immutable telemetry event with timestamp and payload."""
-    event: str
-    payload: Dict[str, Any]
-    timestamp: float
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "event": self.event,
-            "timestamp": self.timestamp,
-            "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.timestamp)),
-            "payload": self.payload,
-        }
-
-    def to_json(self) -> str:
-        """Serialize as JSON line."""
-        return json.dumps(self.to_dict(), ensure_ascii=False)
-
-
-# ====================================================================== #
-# 📡 TelemetryBus — broadcast hub for all runtime / ledger events
-# ====================================================================== #
 class TelemetryBus:
     """
-    Thread-safe pub/sub bus for lightweight telemetry.
-
-    Subscribers are callables:  fn(event: str, payload: dict, timestamp: float) -> None
+    Thread-safe, non-blocking event bus.
     """
 
-    def __init__(self, *, mirror_stdout: bool = True, keep_last: int = 100) -> None:
-        self._subs: List[Callable[[str, Dict[str, Any], float], None]] = []
-        self._mirror_stdout = mirror_stdout
-        self._lock = RLock()
-        self._keep_last = max(1, keep_last)
-        self._history: List[TelemetryMessage] = []
-        self._emit_count: int = 0
+    name: str = "default"
+    max_queue: int = 1024
+    _subscribers: Dict[str, Callable[[str, Dict[str, Any]], None]] = field(default_factory=dict)
+    _queue: "queue.Queue[tuple[str, Dict[str, Any]]]" = field(default_factory=lambda: queue.Queue(maxsize=1024))
+    _thread: Optional[threading.Thread] = None
+    _stop_flag: threading.Event = field(default_factory=threading.Event)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _closed: bool = False
+    _published_count: int = 0
 
     # ------------------------------------------------------------------ #
-    # 🧭 Subscription control
+    # ▶️  Start & Stop
     # ------------------------------------------------------------------ #
-    def subscribe(self, fn: Callable[[str, Dict[str, Any], float], None]) -> None:
-        """Add a subscriber to the bus."""
+    def start(self) -> None:
+        """Start dispatch loop (idempotent)."""
         with self._lock:
-            if fn not in self._subs:
-                self._subs.append(fn)
-                self._safe_print(f"📡 new subscriber: {fn.__name__}")
+            if self._thread and self._thread.is_alive():
+                return
+            if self._closed:
+                raise RuntimeError("[bus] cannot start a closed bus")
+            self._stop_flag.clear()
+            self._thread = threading.Thread(target=self._dispatch_loop, daemon=True)
+            self._thread.start()
+            print(f"[bus:{self.name}] started.")
 
-    def unsubscribe(self, fn: Callable[[str, Dict[str, Any], float], None]) -> None:
-        """Remove a subscriber from the bus."""
+    def close(self) -> None:
+        """Stop the bus and drain queue."""
         with self._lock:
+            if self._closed:
+                return
+            self._stop_flag.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        # Drain queue without blocking
+        while not self._queue.empty():
             try:
-                self._subs.remove(fn)
-                self._safe_print(f"🕊️ unsubscribed: {fn.__name__}")
-            except ValueError:
-                self._safe_print(f"⚠️ tried to remove unknown subscriber: {fn}")
-
-    # ------------------------------------------------------------------ #
-    # 🗞️ Emit events
-    # ------------------------------------------------------------------ #
-    def emit(self, event: str, **payload: Any) -> None:
-        """
-        Publish an event to all subscribers.
-        Never blocks or raises; errors are logged locally.
-        """
-        now = time.time()
-        msg = TelemetryMessage(event, payload, now)
-
-        # store to history (ring buffer)
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
         with self._lock:
-            self._emit_count += 1
-            self._history.append(msg)
-            if len(self._history) > self._keep_last:
-                self._history.pop(0)
-            subs_snapshot = list(self._subs)
+            self._subscribers.clear()
+            self._closed = True
+        print(f"[bus:{self.name}] closed after {self._published_count} events.")
 
-        # mirror to stdout for visibility
-        if self._mirror_stdout:
-            self._safe_print(f"{msg.to_json()}")
+    # ------------------------------------------------------------------ #
+    # 📨  Subscribe / Unsubscribe
+    # ------------------------------------------------------------------ #
+    def subscribe(self, name: str, callback: Callable[[str, Dict[str, Any]], None]) -> None:
+        """Register a subscriber callback."""
+        if self._closed:
+            print(f"[bus:{self.name}] subscribe() ignored — closed.")
+            return
+        with self._lock:
+            self._subscribers[name] = callback
+        print(f"[bus:{self.name}] new subscriber: {name}")
 
-        # dispatch to subscribers
-        for fn in subs_snapshot:
+    def unsubscribe(self, name: str) -> None:
+        """Remove a subscriber safely."""
+        with self._lock:
+            if name in self._subscribers:
+                del self._subscribers[name]
+                print(f"[bus:{self.name}] unsubscribed: {name}")
+
+    # ------------------------------------------------------------------ #
+    # 📢  Publish
+    # ------------------------------------------------------------------ #
+    def publish(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        """Non-blocking publish."""
+        if self._closed:
+            return
+        payload = payload or {}
+        try:
+            self._queue.put_nowait((event, payload))
+            self._published_count += 1
+        except queue.Full:
+            # Drop oldest item to make room
             try:
-                fn(event, payload, now)
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:
-                # We catch individual subscriber errors but keep the bus alive.
-                self._safe_print(f"[bus] subscriber {fn.__name__} error: {exc}")
+                _ = self._queue.get_nowait()
+                self._queue.put_nowait((event, payload))
+            except Exception:
+                pass  # if even that fails, silently skip
+        # Lazy-start dispatcher
+        if not (self._thread and self._thread.is_alive()):
+            self.start()
 
     # ------------------------------------------------------------------ #
-    # 📖 History and inspection
+    # 🔁  Dispatcher loop
     # ------------------------------------------------------------------ #
-    def last(self, n: int = 1) -> List[TelemetryMessage]:
-        """Return the last n messages."""
-        with self._lock:
-            return list(self._history[-n:])
+    def _dispatch_loop(self) -> None:
+        """Continuously deliver events to subscribers."""
+        while not self._stop_flag.is_set():
+            try:
+                event, payload = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            with self._lock:
+                subs = list(self._subscribers.items())
+            for name, cb in subs:
+                try:
+                    cb(event, payload)
+                except Exception as exc:
+                    # Print once per error to avoid noisy floods
+                    print(f"[bus:{self.name}] subscriber '{name}' error: {exc}")
 
-    def stats(self) -> Dict[str, Any]:
-        """Return quick metrics about bus usage."""
+    # ------------------------------------------------------------------ #
+    # 🧭  Diagnostics
+    # ------------------------------------------------------------------ #
+    def status(self) -> Dict[str, Any]:
+        """Return bus diagnostics."""
         with self._lock:
             return {
-                "emit_count": self._emit_count,
-                "subscribers": len(self._subs),
-                "history": len(self._history),
+                "name": self.name,
+                "closed": self._closed,
+                "subscribers": list(self._subscribers.keys()),
+                "queued": self._queue.qsize(),
+                "published": self._published_count,
             }
 
-    # ------------------------------------------------------------------ #
-    # 🪶 Utilities
-    # ------------------------------------------------------------------ #
-    def _safe_print(self, msg: str) -> None:
-        """Write to stdout safely, never crashing the bus."""
-        try:
-            sys.stdout.write(msg + "\n")
-            sys.stdout.flush()
-        except (OSError, IOError) as exc:
-            # console might be closed; ignore
-            sys.stderr.write(f"[bus-print-error] {exc}\n")
-        except Exception as exc:
-            sys.stderr.write(f"[bus-unknown-error] {exc}\n")
-
-    # ------------------------------------------------------------------ #
-    # 🧹 Maintenance
-    # ------------------------------------------------------------------ #
-    def clear(self) -> None:
-        """Erase stored history (does not affect subscribers)."""
-        with self._lock:
-            self._history.clear()
-            self._emit_count = 0
-        self._safe_print("🧹 telemetry history cleared")
-
-    # ------------------------------------------------------------------ #
-    # 🕊️ Context manager
-    # ------------------------------------------------------------------ #
-    def __enter__(self) -> "TelemetryBus":
-        self._safe_print("📡 TelemetryBus online")
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self._safe_print("📡 TelemetryBus offline")
-        self.clear()
-
-    # ------------------------------------------------------------------ #
-    # 🔍 Representation
-    # ------------------------------------------------------------------ #
     def __repr__(self) -> str:
-        s = self.stats()
-        return (
-            f"<TelemetryBus subs={s['subscribers']} "
-            f"history={s['history']} emits={s['emit_count']}>"
-        )
+        state = "closed" if self._closed else "open"
+        return f"<TelemetryBus {self.name} subs={len(self._subscribers)} {state}>"

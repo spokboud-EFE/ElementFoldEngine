@@ -43,10 +43,17 @@ class Studio:
     # ------------------------------------------------------------------ #
     # 🧱 Setup and teardown
     # ------------------------------------------------------------------ #
-    def add_core(self, name: str, runtime: Optional[Runtime] = None, ledger: Optional[Ledger] = None) -> None:
-        """Create and register a new core."""
-        self.factory.register_core(name, runtime or Runtime(), ledger)
+    # elementfold/studio/studio.py
+    def add_core(self, name: str, runtime: Optional[Runtime] = None, ledger: Optional[Any] = None) -> None:
+        """
+        Create and register a new core.
+
+        NOTE: 'ledger' is ignored in the new Factory API; the Factory creates its own Ledger.
+        This keeps backward compatibility with old calls that passed a ledger.
+        """
+        self.factory.register_core(name, runtime or Runtime())
         print(f"[studio] 🎬 Core '{name}' added to factory.")
+
 
     def start(self) -> None:
         """Start factory + optional monitor."""

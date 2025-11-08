@@ -1,154 +1,225 @@
 """
-studio/studio_manager.py — Studio Session Manager 🪄
-
+studio/studio_manager.py — Stable Studio Session Manager 🪄
 ──────────────────────────────────────────────────────────────────────
-ki──────────────────────────────────────────────────────────────────────
-• The StudioManager replaces shell scripts and tmux.
-• It spawns and supervises the Menu, Panels, and Brain in separate
-  Python processes, so you can attach/detach or run headless safely.
-• It prints a dim, calm farewell when everything stops.
+Purpose
+  • Manage one Studio session, no automatic fake runs.
+  • Panels start only when explicitly attached.
+  • Each process has a PID file under ~/.elementfold/pids.
+  • Clean shutdown guarantees: no zombie processes, no repainting.
 ──────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
-
 import multiprocessing as mp
 import os
+import signal
 import sys
 import time
-import traceback
-from dataclasses import dataclass
-from typing import Optional
+import json
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Optional, Dict
 
 from elementfold.studio.studio import Studio
-from elementfold.studio.studio_menu import StudioMenu
 from elementfold.studio.telemetry_panel import TelemetryPanel
 from elementfold.studio.studio_brain_panel import StudioBrainPanel
+from elementfold.studio.studio_menu import StudioMenu
 
 
-# ====================================================================== #
+# ------------------------------------------------------------------ #
+# Paths & constants
+# ------------------------------------------------------------------ #
+ROOT_DIR = Path.home() / ".elementfold"
+PID_DIR = ROOT_DIR / "pids"
+LOG_DIR = ROOT_DIR / "logs"
+SESSION_FILE = ROOT_DIR / "session.json"
+
+for d in (PID_DIR, LOG_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+
+# ------------------------------------------------------------------ #
+# Helper: PID file management
+# ------------------------------------------------------------------ #
+def write_pid(name: str, pid: int) -> None:
+    (PID_DIR / f"{name}.pid").write_text(str(pid))
+
+
+def clear_pids() -> None:
+    for p in PID_DIR.glob("*.pid"):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ #
+# Helper: graceful signal handling
+# ------------------------------------------------------------------ #
+def _graceful_exit(signum, frame):
+    print(f"\033[2m[studio] caught signal {signum}, shutting down...\033[0m")
+    sys.stdout.flush()
+    StudioManager().shutdown()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, _graceful_exit)
+signal.signal(signal.SIGTERM, _graceful_exit)
+
+
+# ================================================================== #
 # 🧩 StudioManager
-# ====================================================================== #
+# ================================================================== #
 @dataclass
 class StudioManager:
     """
-    Manages Studio subsystems as separate processes.
-    Provides start, attach, detach, and shutdown control.
+    Single-session manager.  No fake runs; Studio remains idle until
+    a device is attached.  Panels can be started/stopped explicitly.
     """
 
     refresh_interval: float = 1.0
     brain_refresh: float = 2.0
     _studio: Optional[Studio] = None
-    _menu_proc: Optional[mp.Process] = None
     _telemetry_proc: Optional[mp.Process] = None
     _brain_proc: Optional[mp.Process] = None
+    _menu_proc: Optional[mp.Process] = None
     _stop_event: mp.Event = mp.Event()
+    _session_id: float = time.time()
 
-    # ------------------------------------------------------------------ #
-    # 🎬 Launch
-    # ------------------------------------------------------------------ #
+    # -------------------------------------------------------------- #
+    # 🎬 Session control
+    # -------------------------------------------------------------- #
     def start(self) -> None:
-        """Spawn Studio and its components in separate processes."""
+        """Initialize a headless Studio session."""
         if self._studio:
             print("[manager] Studio already running.")
             return
 
         self._studio = Studio()
-        self._studio.add_core("alpha")
+        self._studio.add_core("alpha")  # core exists but idle
+        print("[manager] Studio initialized — idle, no device attached.")
+        self._write_session_file(status="idle")
 
-        # Start background processes
-        self._telemetry_proc = mp.Process(target=self._run_panel, name="TelemetryPanel")
-        self._brain_proc = mp.Process(target=self._run_brain_panel, name="BrainPanel")
-        self._menu_proc = mp.Process(target=self._run_menu, name="StudioMenu")
+    # -------------------------------------------------------------- #
+    # 🔗 Attach / Detach panels
+    # -------------------------------------------------------------- #
+    def attach_panels(self) -> None:
+        """Attach telemetry & brain panels as subprocesses."""
+        if not self._studio:
+            self.start()
 
-        print("🪄 Starting Studio session...")
-        self._telemetry_proc.start()
-        time.sleep(0.2)
-        self._brain_proc.start()
-        time.sleep(0.2)
-        self._menu_proc.start()
-        print("[manager] All subsystems launched. Type Ctrl+C or use menu 'exit' to quit.")
+        print("[manager] Attaching panels...")
+        self._telemetry_proc = self._spawn(
+            "telemetry", self._run_panel, LOG_DIR / "telemetry.log"
+        )
+        self._brain_proc = self._spawn(
+            "brain", self._run_brain, LOG_DIR / "brain.log"
+        )
+        self._menu_proc = self._spawn(
+            "menu", self._run_menu, LOG_DIR / "menu.log"
+        )
+        self._write_session_file(status="attached")
+        print(f"[manager] Panels attached. Logs → {LOG_DIR}")
 
-    # ------------------------------------------------------------------ #
-    # 🧭 Attach/Detach
-    # ------------------------------------------------------------------ #
-    def attach(self) -> None:
-        """Attach to existing session (reprint PIDs and status)."""
-        print(f"[manager] Attached to session:")
-        for name, proc in self._procs().items():
-            print(f"  {name:<15} PID={proc.pid if proc else '—'}  alive={proc.is_alive() if proc else False}")
+    def detach_panels(self) -> None:
+        """Leave panels running in background."""
+        print("[manager] Detached; panels continue quietly.")
+        self._write_session_file(status="detached")
 
-    def detach(self) -> None:
-        """Detach without killing processes (panels keep running)."""
-        print("[manager] Detached from Studio session. Panels continue in background.")
-
-    # ------------------------------------------------------------------ #
+    # -------------------------------------------------------------- #
     # 🧹 Shutdown
-    # ------------------------------------------------------------------ #
+    # -------------------------------------------------------------- #
     def shutdown(self) -> None:
-        """Gracefully terminate all sub-processes."""
-        print("[manager] Shutting down Studio...")
+        """Terminate panels and Studio gracefully."""
+        print("[manager] shutting down Studio...")
         self._stop_event.set()
         for name, proc in self._procs().items():
             if proc and proc.is_alive():
-                proc.terminate()
-                print(f"  🔚 {name} terminated (PID {proc.pid})")
-        self._studio = None
-        self._menu_proc = None
-        self._telemetry_proc = None
-        self._brain_proc = None
+                try:
+                    proc.terminate()
+                    print(f"  🔚 {name} terminated (PID {proc.pid})")
+                except Exception:
+                    pass
+        if self._studio:
+            try:
+                self._studio.shutdown()
+            except Exception:
+                pass
+        clear_pids()
+        self._write_session_file(status="stopped")
         print("\033[2m[studio] ✨ system cooled and exited\033[0m")
 
-    # ------------------------------------------------------------------ #
-    # 🧠 Process targets
-    # ------------------------------------------------------------------ #
+    # -------------------------------------------------------------- #
+    # 🧠 Internal process targets
+    # -------------------------------------------------------------- #
     def _run_panel(self) -> None:
+        studio = self._studio or Studio()
+        panel = TelemetryPanel(
+            studio.factory, guard=studio.guard, refresh_interval=self.refresh_interval
+        )
+        panel.start()
         try:
-            studio = Studio()
-            studio.add_core("alpha")
-            studio.start()
-            panel = TelemetryPanel(studio.factory, guard=studio.guard, refresh_interval=self.refresh_interval)
-            panel.start()
             while not self._stop_event.is_set():
-                time.sleep(0.1)
+                time.sleep(0.2)
+        finally:
             panel.stop()
             studio.shutdown()
-        except Exception as exc:
-            print(f"[TelemetryPanel] crashed: {exc}")
-            traceback.print_exc()
 
-    def _run_brain_panel(self) -> None:
+    def _run_brain(self) -> None:
+        studio = self._studio or Studio()
+        brain = StudioBrainPanel(studio, refresh_interval=self.brain_refresh)
+        brain.start()
         try:
-            studio = Studio()
-            studio.add_core("alpha")
-            studio.start()
-            brain = StudioBrainPanel(studio, refresh_interval=self.brain_refresh)
-            brain.start()
             while not self._stop_event.is_set():
-                time.sleep(0.1)
+                time.sleep(0.2)
+        finally:
             brain.stop()
             studio.shutdown()
-        except Exception as exc:
-            print(f"[BrainPanel] crashed: {exc}")
-            traceback.print_exc()
 
     def _run_menu(self) -> None:
         try:
-            menu = StudioMenu()
+            menu = StudioMenu(self._studio)
             menu.start()
         except KeyboardInterrupt:
             print("\n[manager] Menu interrupted by user.")
             self.shutdown()
-        except Exception as exc:
-            print(f"[StudioMenu] crashed: {exc}")
-            traceback.print_exc()
 
-    # ------------------------------------------------------------------ #
-    # 📦 Utilities
-    # ------------------------------------------------------------------ #
-    def _procs(self) -> dict[str, Optional[mp.Process]]:
+    # -------------------------------------------------------------- #
+    # 🧰 Utilities
+    # -------------------------------------------------------------- #
+    def _spawn(self, name: str, target, logfile: Path) -> mp.Process:
+        """Start a subprocess with redirected output."""
+        def _wrapped():
+            sys.stdout = open(logfile, "w", buffering=1)
+            sys.stderr = sys.stdout
+            write_pid(name, os.getpid())
+            try:
+                target()
+            except Exception as e:
+                print(f"[{name}] crashed: {e}")
+                import traceback
+                traceback.print_exc(file=sys.stdout)
+
+        p = mp.get_context("spawn").Process(target=_wrapped, name=name)
+        p.start()
+        return p
+
+    def _procs(self) -> Dict[str, Optional[mp.Process]]:
         return {
-            "menu": self._menu_proc,
             "telemetry": self._telemetry_proc,
             "brain": self._brain_proc,
+            "menu": self._menu_proc,
         }
+
+    def _write_session_file(self, status: str) -> None:
+        """Record session metadata for reattachment."""
+        data = {
+            "session_id": self._session_id,
+            "status": status,
+            "pids": {
+                k: (v.pid if v and v.is_alive() else None)
+                for k, v in self._procs().items()
+            },
+            "timestamp": time.time(),
+        }
+        SESSION_FILE.write_text(json.dumps(data, indent=2))
