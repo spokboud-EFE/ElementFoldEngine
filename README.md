@@ -6,9 +6,9 @@
 
 Publicly available exclusively for non-profit organizations. Reproductions for profit arent allowed without a custom commercial license.
 
-Discord Channel ---> [SRT DISCORD](https://discord.gg/nzyWctG2)
+**Discord Channel** ---> [SRT DISCORD](https://discord.gg/nzyWctG2)
 
-Theory ------------> [EFE Theory](https://doi.org/10.5281/zenodo.17564933)
+**Theory** ------------> [EFE Theory](https://doi.org/10.5281/zenodo.17564933)
 
 
 
