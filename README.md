@@ -10,6 +10,7 @@ Publicly available exclusively for non-profit organizations. Reproductions for p
 
 **Theory** ------------> [EFE Theory](https://doi.org/10.5281/zenodo.17573024)
 
+![LOSS_EFE.PNG](./LOSS_EFE.pngg "EFE LOSS FUNCTION")
 
 
 
