@@ -8,7 +8,7 @@ Publicly available exclusively for non-profit organizations. Reproductions for p
 
 **Discord Channel** ---> [SRT DISCORD](https://discord.gg/nzyWctG2)
 
-**Theory** ------------> [EFE Theory](https://doi.org/10.5281/zenodo.17573024)
+**Theory** ------------> [EFE Theory](https://doi.org/10.5281/zenodo.17603191)
 
 ![LOSS_EFE.PNG](./LOSS_EFE.png "EFE LOSS FUNCTION")
 
